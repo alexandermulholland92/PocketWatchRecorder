@@ -60,7 +60,7 @@ private const val BASE_URL = "https://public.heypocketai.com/"
  * route later needs no code change. Treat this file as secret while a literal
  * key is present: don't commit it, and rotate the key if it leaks.
  */
-private const val API_KEY_FALLBACK = "pk_734f073a0bf37582e181fb8c098b515f4803fce0c269103ee2fa2d391d917850"
+private const val API_KEY_FALLBACK = "Your_API_Key_Here"
 
 val API_KEY: String = BuildConfig.POCKET_API_KEY
     .ifBlank { API_KEY_FALLBACK }
