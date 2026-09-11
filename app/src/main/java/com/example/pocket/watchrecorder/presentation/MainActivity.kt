@@ -67,10 +67,17 @@ import androidx.wear.compose.material.Text
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.Vignette
 import androidx.wear.compose.material.VignettePosition
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.pocket.watchrecorder.audio.AudioRecorderManager
 import com.pocket.watchrecorder.network.API_KEY
 import com.pocket.watchrecorder.network.PocketClient
 import com.pocket.watchrecorder.network.PocketPipelineException
+import com.pocket.watchrecorder.upload.QueuedUpload
+import com.pocket.watchrecorder.upload.UploadProgress
+import com.pocket.watchrecorder.upload.UploadQueue
+import com.pocket.watchrecorder.upload.UploadWorker
+import com.pocket.watchrecorder.upload.uploadProgressFraction
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -80,7 +87,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import retrofit2.HttpException
-import java.io.File
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -108,6 +114,7 @@ enum class Phase(val label: String) {
     PROCESSING("Summarizing")
 }
 
+/** What the main screen is showing for the recording currently in focus. */
 sealed interface UiState {
     data object Idle : UiState
 
@@ -124,10 +131,43 @@ sealed interface UiState {
     data class Failed(val message: String, val canRetry: Boolean) : UiState
 }
 
+enum class ItemStatus(val label: String) {
+    WAITING("Waiting"),
+    UPLOADING("Uploading"),
+    PROCESSING("Summarizing"),
+    READY("Ready"),
+    FAILED("Failed")
+}
+
+/** One row in the library list. */
+data class QueueItem(
+    val id: String,
+    val title: String,
+    val ageLabel: String,
+    val status: ItemStatus,
+    val progress: Float?,
+    val summary: String?
+)
+
+sealed interface Route {
+    data object Main : Route
+    data object Library : Route
+    data class Detail(val id: String) : Route
+}
+
 // ===========================================================================
-// ViewModel — owns the recorder and the upload/poll pipeline
+// ViewModel
 // ===========================================================================
 
+/**
+ * Owns the recorder and follows every queued recording concurrently.
+ *
+ * The key difference from a single-job design: each queue entry gets its own
+ * tracker coroutine, keyed by id. Starting a new recording no longer cancels
+ * the one before it — that earlier recording keeps uploading, keeps polling,
+ * and writes its summary into its own sidecar when it lands. The main screen
+ * simply follows whichever entry is "focused"; the rest surface in the library.
+ */
 class RecorderViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
@@ -135,49 +175,147 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         const val WAKE_LOCK_TAG = "PocketWatch::pipeline"
         const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1_000L
         const val METER_INTERVAL_MS = 80L
+        const val QUEUE_POLL_INTERVAL_MS = 1_200L
+        const val LIBRARY_REFRESH_BUSY_MS = 1_000L
+        const val LIBRARY_REFRESH_IDLE_MS = 4_000L
+        const val MAX_UPLOAD_ATTEMPTS = 5
     }
 
     private val recorder = AudioRecorderManager(application)
+    private val queue = UploadQueue(application)
     private val powerManager =
         application.getSystemService(Context.POWER_SERVICE) as PowerManager
 
     private val _state = MutableStateFlow<UiState>(UiState.Idle)
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    private var meterJob: Job? = null
-    private var pipelineJob: Job? = null
+    private val _library = MutableStateFlow<List<QueueItem>>(emptyList())
+    val library: StateFlow<List<QueueItem>> = _library.asStateFlow()
 
-    private var pendingFile: File? = null
-    private var recordingId: String? = null
-    private var uploadComplete = false
+    private val _route = MutableStateFlow<Route>(Route.Main)
+    val route: StateFlow<Route> = _route.asStateFlow()
+
+    private var meterJob: Job? = null
+    private var lastDurationMs: Long = 0L
+
+    /** One tracker per queue entry, keyed by entry id. */
+    private val trackers = mutableMapOf<String, Job>()
+
+    /** Which entry the main screen reflects. Null means "nothing in focus". */
+    private var focusedId: String? = null
+
+    private var workState: WorkInfo.State? = null
+    private var workProgress: Float? = null
+
+    init {
+        viewModelScope.launch {
+            WorkManager.getInstance(application)
+                .getWorkInfosForUniqueWorkFlow(UploadWorker.WORK_NAME)
+                .collect { infos ->
+                    val info = infos.firstOrNull()
+                    workState = info?.state
+                    workProgress = info?.progress?.uploadProgressFraction()
+                }
+        }
+
+        // Live upload progress, applied to the focused entry only.
+        viewModelScope.launch {
+            UploadProgress.state.collect { snapshot ->
+                if (snapshot == null || snapshot.entryId != focusedId) return@collect
+                val current = _state.value
+                if (current is UiState.Working && current.phase == Phase.UPLOADING) {
+                    _state.value = current.copy(progress = snapshot.fraction)
+                }
+            }
+        }
+
+        // Single supervisor: refreshes the library and guarantees that every
+        // entry on disk has a tracker — including ones left over from a
+        // previous launch.
+        viewModelScope.launch {
+            while (isActive) {
+                val entries = queue.all()
+                _library.value = entries.map { it.toItem() }
+                entries.forEach { if (!it.isComplete) ensureTracked(it.id) }
+                delay(
+                    if (entries.any { !it.isComplete }) LIBRARY_REFRESH_BUSY_MS
+                    else LIBRARY_REFRESH_IDLE_MS
+                )
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Public intents
     // -----------------------------------------------------------------------
 
     fun onPrimaryAction() {
-        if (recorder.isRecording) stopAndProcess() else startRecording()
+        if (recorder.isRecording) stopAndQueue() else startRecording()
     }
 
-    fun retry() {
-        val file = pendingFile
-        when {
-            uploadComplete && recordingId != null -> runPipeline(null)
-            file != null && file.exists() -> runPipeline(file)
-            else -> reset()
+    fun openLibrary() {
+        _route.value = Route.Library
+    }
+
+    fun openDetail(id: String) {
+        _route.value = Route.Detail(id)
+    }
+
+    fun backToMain() {
+        _route.value = Route.Main
+    }
+
+    /** Clears the main screen without touching anything still in flight. */
+    fun dismissFocused() {
+        val id = focusedId
+        if (id != null) {
+            val entry = queue.find(id)
+            // Only reclaim space for something the user has actually seen.
+            if (entry != null && (entry.isComplete || entry.isDeadLettered())) {
+                discard(id)
+            }
+        }
+        focusedId = null
+        _state.value = UiState.Idle
+        _route.value = Route.Main
+    }
+
+    /** Removes one recording and stops following it. */
+    fun discard(id: String) {
+        trackers.remove(id)?.cancel()
+        queue.remove(id)
+        _library.value = queue.all().map { it.toItem() }
+        if (focusedId == id) {
+            focusedId = null
+            _state.value = UiState.Idle
         }
     }
 
-    fun reset() {
-        pipelineJob?.cancel()
-        meterJob?.cancel()
-        recorder.cancel()
-        pendingFile?.delete()
-        pendingFile = null
-        recordingId = null
-        uploadComplete = false
-        recorder.purgeAll()
-        _state.value = UiState.Idle
+    /**
+     * Removes every finished recording, leaving anything still uploading or
+     * summarizing alone. Scoped this way on purpose — the old blanket clear()
+     * could delete audio that had never reached S3.
+     */
+    fun clearFinished() {
+        queue.all()
+            .filter { it.isComplete }
+            .forEach { entry ->
+                trackers.remove(entry.id)?.cancel()
+                queue.remove(entry.id)
+                if (focusedId == entry.id) {
+                    focusedId = null
+                    _state.value = UiState.Idle
+                }
+            }
+        _library.value = queue.all().map { it.toItem() }
+    }
+
+    fun retryFocused() {
+        val id = focusedId ?: return dismissFocused()
+        val entry = queue.find(id) ?: return dismissFocused()
+        queue.update(entry.copy(attempts = 0, lastError = null))
+        UploadWorker.schedule(getApplication())
+        ensureTracked(id)
     }
 
     // -----------------------------------------------------------------------
@@ -185,12 +323,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     // -----------------------------------------------------------------------
 
     private fun startRecording() {
-        pipelineJob?.cancel()
-        recordingId = null
-        uploadComplete = false
-        pendingFile?.delete()
-        pendingFile = null
-
         val file = try {
             recorder.start()
         } catch (t: Throwable) {
@@ -198,8 +330,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             _state.value = UiState.Failed("Mic unavailable", canRetry = false)
             return
         }
+        Log.i(TAG, "Recording into ${file.name}")
 
-        pendingFile = file
+        // Focus moves to the new take; earlier entries keep their own trackers.
+        focusedId = null
+        _route.value = Route.Main
         _state.value = UiState.Recording(0L, 0f)
 
         meterJob = viewModelScope.launch {
@@ -210,103 +345,149 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun stopAndProcess() {
+    private fun stopAndQueue() {
         meterJob?.cancel()
+        // Read the length before stop() clears it — Pocket wants it at provisioning.
+        lastDurationMs = recorder.elapsedMillis
         val file = recorder.stop()
 
         if (file == null) {
-            pendingFile = null
             _state.value = UiState.Failed("Too short — hold for a second", canRetry = false)
             return
         }
 
-        pendingFile = file
-        runPipeline(file)
+        val entry = queue.enqueue(
+            audio = file,
+            title = "Watch Recording",
+            durationMs = lastDurationMs
+        )
+        focusedId = entry.id
+        UploadWorker.schedule(getApplication())
+        ensureTracked(entry.id)
+        _library.value = queue.all().map { it.toItem() }
     }
 
     // -----------------------------------------------------------------------
-    // Provision -> upload -> poll
+    // Per-entry tracking
     // -----------------------------------------------------------------------
 
-    /**
-     * Runs the remote half of the workflow.
-     *
-     * Passing `null` for [file] resumes an interrupted run that already got as
-     * far as a successful S3 PUT, so a retry only re-polls.
-     *
-     * Reliability note: this lives in [viewModelScope] rather than a foreground
-     * service because the whole run is bounded (seconds of upload, minutes of
-     * polling) and the activity stays in the foreground task. The
-     * PARTIAL_WAKE_LOCK is the part that actually matters on Wear — without it
-     * the CPU suspends on wrist-down and the poll loop stalls until the user
-     * raises their arm. If you need the run to survive the app being swept out
-     * of memory, swap this body for a WorkManager expedited request keyed on
-     * [recordingId] and observe WorkInfo here instead.
-     */
-    private fun runPipeline(file: File?) {
-        pipelineJob?.cancel()
-        pipelineJob = viewModelScope.launch {
-            val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
-            wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
-
+    private fun ensureTracked(entryId: String) {
+        trackers[entryId]?.let { if (it.isActive) return }
+        trackers[entryId] = viewModelScope.launch {
             try {
-                if (!uploadComplete) {
-                    requireNotNull(file) { "No audio file to upload" }
-
-                    // --- Step 2: provision -----------------------------------
-                    _state.value = UiState.Working(Phase.PROVISIONING)
-                    val provision = PocketClient.createUpload(
-                        fileName = file.name,
-                        contentType = AudioRecorderManager.CONTENT_TYPE,
-                        title = "Watch Recording"
-                    )
-                    recordingId = provision.resolvedRecordingId
-
-                    // --- Step 3: PUT to S3 -----------------------------------
-                    _state.value = UiState.Working(Phase.UPLOADING, progress = 0f)
-                    PocketClient.uploadRecording(
-                        uploadUrl = provision.resolvedUploadUrl!!,
-                        file = file,
-                        contentType = AudioRecorderManager.CONTENT_TYPE
-                    ) { progress ->
-                        _state.value = UiState.Working(Phase.UPLOADING, progress = progress)
-                    }
-
-                    uploadComplete = true
-                    // Audio is safely in S3; reclaim the watch's storage.
-                    recorder.purgeAll()
-                    pendingFile = null
-                }
-
-                // --- Step 4: poll for the summary ---------------------------
-                val id = requireNotNull(recordingId) { "Missing recording id" }
-                _state.value = UiState.Working(Phase.PROCESSING)
-
-                val recording = PocketClient.awaitProcessing(id) { status ->
-                    _state.value = UiState.Working(Phase.PROCESSING, detail = status)
-                }
-
-                _state.value = UiState.Done(
-                    title = recording.title,
-                    summary = recording.summaryText
-                        ?: recording.transcriptText
-                        ?: "Processed, but no summary text was returned."
-                )
-            } catch (timeout: TimeoutCancellationException) {
-                // TimeoutCancellationException IS a CancellationException, so it
-                // must be caught before the generic cancellation rethrow below.
-                Log.w(TAG, "Timed out waiting for the summary", timeout)
-                _state.value = UiState.Failed("Still processing — check back", canRetry = true)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (t: Throwable) {
-                Log.e(TAG, "Pipeline failed", t)
-                _state.value = UiState.Failed(t.toUserMessage(), canRetry = true)
+                track(entryId)
             } finally {
-                if (wakeLock.isHeld) runCatching { wakeLock.release() }
+                trackers.remove(entryId)
             }
         }
     }
+
+    /**
+     * Follows one entry from "queued" to "summarized".
+     *
+     * Owns none of the transfer — [UploadWorker] does the provisioning and the
+     * PUT. If this coroutine dies, the upload still completes and the supervisor
+     * loop starts a fresh tracker from the sidecar.
+     */
+    private suspend fun track(entryId: String) {
+        var entry = queue.find(entryId) ?: return
+        if (entry.isComplete) {
+            publish(entryId, UiState.Done(entry.summaryTitle, entry.summary!!))
+            return
+        }
+
+        val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+        wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
+
+        try {
+            // --- Wait for the worker to land the bytes in S3 -----------------
+            while (!entry.uploaded) {
+                val failure = entry.lastError
+                if (entry.isDeadLettered()) {
+                    publish(entryId, UiState.Failed(failure ?: "Upload failed", canRetry = true))
+                    return
+                }
+
+                publish(
+                    entryId,
+                    UiState.Working(
+                        phase = Phase.UPLOADING,
+                        progress = UploadProgress.fractionFor(entryId) ?: workProgress,
+                        detail = when {
+                            failure != null -> "retrying · ${entry.attempts}"
+                            workState == WorkInfo.State.ENQUEUED -> "waiting for network"
+                            else -> null
+                        }
+                    )
+                )
+
+                delay(QUEUE_POLL_INTERVAL_MS)
+                entry = queue.find(entryId) ?: return
+            }
+
+            val recordingId = entry.recordingId
+            if (recordingId.isNullOrBlank()) {
+                publish(entryId, UiState.Failed("Uploaded without an id", canRetry = true))
+                return
+            }
+
+            // --- Poll for the summary ---------------------------------------
+            publish(entryId, UiState.Working(Phase.PROCESSING))
+            val recording = PocketClient.awaitProcessing(recordingId) { status ->
+                publish(entryId, UiState.Working(Phase.PROCESSING, detail = status))
+            }
+
+            val text = recording.summaryText
+                ?: recording.transcriptText
+                ?: "Processed, but no summary text was returned."
+
+            // Persist before publishing, so a restart can still read it.
+            queue.find(entryId)?.let { latest ->
+                queue.update(
+                    latest.copy(
+                        summary = text,
+                        summaryTitle = recording.title,
+                        completedAtEpochMs = System.currentTimeMillis()
+                    )
+                )
+            }
+            publish(entryId, UiState.Done(recording.title, text))
+        } catch (timeout: TimeoutCancellationException) {
+            // Must precede the CancellationException branch: it is one.
+            Log.w(TAG, "Timed out waiting for the summary", timeout)
+            publish(entryId, UiState.Failed("Still processing — check back", canRetry = true))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            Log.e(TAG, "Tracking failed for $entryId", t)
+            publish(entryId, UiState.Failed(t.toUserMessage(), canRetry = true))
+        } finally {
+            if (wakeLock.isHeld) runCatching { wakeLock.release() }
+        }
+    }
+
+    /** Main-screen updates apply only to the entry the user is watching. */
+    private fun publish(entryId: String, next: UiState) {
+        if (entryId == focusedId) _state.value = next
+    }
+
+    private fun QueuedUpload.isDeadLettered(): Boolean =
+        lastError != null && attempts >= MAX_UPLOAD_ATTEMPTS
+
+    private fun QueuedUpload.toItem(): QueueItem = QueueItem(
+        id = id,
+        title = summaryTitle?.takeIf { it.isNotBlank() } ?: title,
+        ageLabel = relativeAge(queuedAtEpochMs),
+        status = when {
+            isComplete -> ItemStatus.READY
+            isDeadLettered() -> ItemStatus.FAILED
+            uploaded -> ItemStatus.PROCESSING
+            UploadProgress.fractionFor(id) != null -> ItemStatus.UPLOADING
+            else -> ItemStatus.WAITING
+        },
+        progress = UploadProgress.fractionFor(id),
+        summary = summary
+    )
 
     override fun onCleared() {
         super.onCleared()
@@ -342,17 +523,24 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     /**
      * Debug aid: walks to the deepest cause and reports its class + message.
-     *
-     * ExceptionInInitializerError / NoClassDefFoundError both carry a null
-     * message, so the generic fallback used to render as "Something went
-     * wrong" and hide the only useful detail. Swap this back to a friendly
-     * string once the integration is stable.
+     * Swap this back to a friendly string once the integration is stable.
      */
     private fun describeRootCause(t: Throwable): String {
         val root = generateSequence(t) { it.cause }.last()
         val name = root::class.java.simpleName.ifBlank { root::class.java.name }
         val detail = root.message?.takeIf { it.isNotBlank() }
         return if (detail != null) "$name: $detail" else name
+    }
+}
+
+private fun relativeAge(epochMs: Long): String {
+    if (epochMs <= 0L) return ""
+    val seconds = ((System.currentTimeMillis() - epochMs) / 1000).coerceAtLeast(0)
+    return when {
+        seconds < 60 -> "just now"
+        seconds < 3_600 -> "${seconds / 60}m ago"
+        seconds < 86_400 -> "${seconds / 3_600}h ago"
+        else -> "${seconds / 86_400}d ago"
     }
 }
 
@@ -384,6 +572,8 @@ private val PocketColors = Colors(
 fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
     val context = LocalContext.current
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val library by viewModel.library.collectAsStateWithLifecycle()
+    val route by viewModel.route.collectAsStateWithLifecycle()
 
     var hasMicPermission by remember {
         mutableStateOf(
@@ -414,12 +604,13 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
     }
 
     val listState = rememberScalingLazyListState()
+    val scrolling = route !is Route.Main || state is UiState.Done
 
     MaterialTheme(colors = PocketColors) {
         Scaffold(
             timeText = { TimeText() },
             vignette = { Vignette(vignettePosition = VignettePosition.TopAndBottom) },
-            positionIndicator = { if (state is UiState.Done) PositionIndicator(listState) }
+            positionIndicator = { if (scrolling) PositionIndicator(listState) }
         ) {
             Box(
                 modifier = Modifier
@@ -433,34 +624,85 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
                         onGrant = { permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) }
                     )
 
-                    else -> when (val current = state) {
-                        is UiState.Idle -> IdleScreen(onStart = viewModel::onPrimaryAction)
+                    route is Route.Library -> LibraryScreen(
+                        items = library,
+                        listState = listState,
+                        onOpen = viewModel::openDetail,
+                        onDiscard = viewModel::discard,
+                        onClearFinished = viewModel::clearFinished,
+                        onBack = viewModel::backToMain
+                    )
 
-                        is UiState.Recording -> RecordingScreen(
-                            elapsedMs = current.elapsedMs,
-                            level = current.level,
-                            onStop = viewModel::onPrimaryAction
-                        )
-
-                        is UiState.Working -> WorkingScreen(current)
-
-                        is UiState.Done -> DoneScreen(
-                            title = current.title,
-                            summary = current.summary,
+                    route is Route.Detail -> {
+                        val item = library.firstOrNull { it.id == (route as Route.Detail).id }
+                        SummaryScreen(
+                            title = item?.title,
+                            summary = item?.summary ?: "Still working on this one.",
                             listState = listState,
-                            onReset = viewModel::reset
-                        )
-
-                        is UiState.Failed -> FailedScreen(
-                            message = current.message,
-                            canRetry = current.canRetry,
-                            onRetry = viewModel::retry,
-                            onDismiss = viewModel::reset
+                            primaryLabel = "Back",
+                            onPrimary = viewModel::openLibrary
                         )
                     }
+
+                    else -> MainRoute(
+                        state = state,
+                        library = library,
+                        listState = listState,
+                        viewModel = viewModel
+                    )
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun MainRoute(
+    state: UiState,
+    library: List<QueueItem>,
+    listState: ScalingLazyListState,
+    viewModel: RecorderViewModel
+) {
+    // Anything not currently on the main screen that still wants attention.
+    val otherCount = library.count { it.status != ItemStatus.READY } +
+            library.count { it.status == ItemStatus.READY && state !is UiState.Done }
+
+    when (state) {
+        is UiState.Idle -> IdleScreen(
+            queuedCount = library.size,
+            onStart = viewModel::onPrimaryAction,
+            onOpenLibrary = viewModel::openLibrary
+        )
+
+        is UiState.Recording -> RecordingScreen(
+            elapsedMs = state.elapsedMs,
+            level = state.level,
+            onStop = viewModel::onPrimaryAction
+        )
+
+        is UiState.Working -> WorkingScreen(
+            state = state,
+            otherCount = (otherCount - 1).coerceAtLeast(0),
+            onOpenLibrary = viewModel::openLibrary,
+            onRecordAnother = viewModel::onPrimaryAction
+        )
+
+        is UiState.Done -> SummaryScreen(
+            title = state.title,
+            summary = state.summary,
+            listState = listState,
+            primaryLabel = "New recording",
+            onPrimary = viewModel::dismissFocused,
+            secondaryLabel = if (library.size > 1) "Library (${library.size})" else null,
+            onSecondary = viewModel::openLibrary
+        )
+
+        is UiState.Failed -> FailedScreen(
+            message = state.message,
+            canRetry = state.canRetry,
+            onRetry = viewModel::retryFocused,
+            onDismiss = viewModel::dismissFocused
+        )
     }
 }
 
@@ -492,19 +734,25 @@ private fun PermissionScreen(denied: Boolean, onGrant: () -> Unit) {
 }
 
 @Composable
-private fun IdleScreen(onStart: () -> Unit) {
+private fun IdleScreen(queuedCount: Int, onStart: () -> Unit, onOpenLibrary: () -> Unit) {
     CenteredColumn {
-        Text(
-            text = "Pocket",
-            style = MaterialTheme.typography.title2
-        )
+        Text(text = "Pocket", style = MaterialTheme.typography.title2)
         Text(
             text = "Tap to record",
             style = MaterialTheme.typography.caption1,
             color = MaterialTheme.colors.onSurfaceVariant,
-            modifier = Modifier.padding(top = 2.dp, bottom = 14.dp)
+            modifier = Modifier.padding(top = 2.dp, bottom = 12.dp)
         )
         RecordButton(recording = false, level = 0f, onClick = onStart)
+
+        if (queuedCount > 0) {
+            Chip(
+                label = { Text("$queuedCount in queue") },
+                onClick = onOpenLibrary,
+                colors = ChipDefaults.secondaryChipColors(),
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
     }
 }
 
@@ -527,14 +775,19 @@ private fun RecordingScreen(elapsedMs: Long, level: Float, onStop: () -> Unit) {
 }
 
 @Composable
-private fun WorkingScreen(state: UiState.Working) {
+private fun WorkingScreen(
+    state: UiState.Working,
+    otherCount: Int,
+    onOpenLibrary: () -> Unit,
+    onRecordAnother: () -> Unit
+) {
     CenteredColumn {
         Box(contentAlignment = Alignment.Center) {
             val progress = state.progress
             if (progress != null) {
                 CircularProgressIndicator(
                     progress = progress,
-                    modifier = Modifier.size(64.dp),
+                    modifier = Modifier.size(58.dp),
                     strokeWidth = 5.dp,
                     indicatorColor = MaterialTheme.colors.primary,
                     trackColor = MaterialTheme.colors.surface
@@ -545,7 +798,7 @@ private fun WorkingScreen(state: UiState.Working) {
                 )
             } else {
                 CircularProgressIndicator(
-                    modifier = Modifier.size(64.dp),
+                    modifier = Modifier.size(58.dp),
                     strokeWidth = 5.dp,
                     indicatorColor = MaterialTheme.colors.primary,
                     trackColor = MaterialTheme.colors.surface
@@ -556,7 +809,7 @@ private fun WorkingScreen(state: UiState.Working) {
         Text(
             text = state.phase.label,
             style = MaterialTheme.typography.title3,
-            modifier = Modifier.padding(top = 12.dp)
+            modifier = Modifier.padding(top = 10.dp)
         )
         state.detail?.let { detail ->
             Text(
@@ -565,25 +818,131 @@ private fun WorkingScreen(state: UiState.Working) {
                 color = MaterialTheme.colors.onSurfaceVariant
             )
         }
+
+        // Uploading happens in the background, so starting another take is fine.
+        Chip(
+            label = { Text("Record another") },
+            onClick = onRecordAnother,
+            colors = ChipDefaults.secondaryChipColors(),
+            modifier = Modifier.padding(top = 10.dp)
+        )
+        if (otherCount > 0) {
+            Chip(
+                label = { Text("$otherCount more queued") },
+                onClick = onOpenLibrary,
+                colors = ChipDefaults.secondaryChipColors(),
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
     }
 }
 
 @Composable
-private fun DoneScreen(
+private fun LibraryScreen(
+    items: List<QueueItem>,
+    listState: ScalingLazyListState,
+    onOpen: (String) -> Unit,
+    onDiscard: (String) -> Unit,
+    onClearFinished: () -> Unit,
+    onBack: () -> Unit
+) {
+    val finishedCount = items.count { it.status == ItemStatus.READY }
+
+    ScalingLazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize(),
+        anchorType = ScalingLazyListAnchorType.ItemStart,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 30.dp)
+    ) {
+        item {
+            Text(
+                text = "Recordings",
+                style = MaterialTheme.typography.title3,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
+
+        if (items.isEmpty()) {
+            item {
+                Text(
+                    text = "Nothing queued",
+                    style = MaterialTheme.typography.caption1,
+                    color = MaterialTheme.colors.onSurfaceVariant
+                )
+            }
+        }
+
+        items(items.size) { index ->
+            val item = items[index]
+            Chip(
+                label = { Text(item.title, maxLines = 1) },
+                secondaryLabel = {
+                    Text(
+                        text = buildString {
+                            append(item.status.label)
+                            item.progress?.let { append(" ${(it * 100).toInt()}%") }
+                            if (item.ageLabel.isNotBlank()) append(" · ${item.ageLabel}")
+                        },
+                        maxLines = 1
+                    )
+                },
+                onClick = {
+                    if (item.status == ItemStatus.FAILED) onDiscard(item.id) else onOpen(item.id)
+                },
+                colors = if (item.status == ItemStatus.READY) {
+                    ChipDefaults.primaryChipColors()
+                } else {
+                    ChipDefaults.secondaryChipColors()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp)
+            )
+        }
+
+        if (finishedCount > 0) {
+            item {
+                Chip(
+                    label = { Text("Clear finished ($finishedCount)") },
+                    onClick = onClearFinished,
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                )
+            }
+        }
+
+        item {
+            Chip(
+                label = { Text("Back") },
+                onClick = onBack,
+                colors = ChipDefaults.secondaryChipColors(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SummaryScreen(
     title: String?,
     summary: String,
     listState: ScalingLazyListState,
-    onReset: () -> Unit
+    primaryLabel: String,
+    onPrimary: () -> Unit,
+    secondaryLabel: String? = null,
+    onSecondary: (() -> Unit)? = null
 ) {
     ScalingLazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize(),
         anchorType = ScalingLazyListAnchorType.ItemStart,
         horizontalAlignment = Alignment.CenterHorizontally,
-        contentPadding = PaddingValues(
-            horizontal = 14.dp,
-            vertical = 32.dp
-        )
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 32.dp)
     ) {
         item {
             Text(
@@ -603,13 +962,25 @@ private fun DoneScreen(
         }
         item {
             Chip(
-                label = { Text("New recording") },
-                onClick = onReset,
+                label = { Text(primaryLabel) },
+                onClick = onPrimary,
                 colors = ChipDefaults.primaryChipColors(),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 10.dp)
             )
+        }
+        if (secondaryLabel != null && onSecondary != null) {
+            item {
+                Chip(
+                    label = { Text(secondaryLabel) },
+                    onClick = onSecondary,
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp)
+                )
+            }
         }
     }
 }
@@ -696,7 +1067,6 @@ private fun RecordButton(
             val center = Offset(size.width / 2f, size.height / 2f)
             val outerRadius = size.minDimension / 2f
 
-            // Input-level ring (only meaningful while recording).
             if (ring > 0.01f) {
                 drawCircle(
                     color = accent.copy(alpha = 0.28f + 0.32f * ring),
@@ -706,7 +1076,6 @@ private fun RecordButton(
                 )
             }
 
-            // Idle = filled circle. Recording = rounded square (stop affordance).
             val idleRadius = outerRadius * 0.42f
             val stopSide = outerRadius * 0.62f
             val cornerPx = (idleRadius * (1f - morph)).coerceAtLeast(3.dp.toPx())

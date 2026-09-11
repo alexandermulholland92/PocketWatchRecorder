@@ -1,6 +1,7 @@
 package com.pocket.watchrecorder.network
 
 import com.pocket.watchrecorder.BuildConfig
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -74,8 +75,11 @@ val API_KEY: String = BuildConfig.POCKET_API_KEY
 @Serializable
 data class UploadUrlRequest(
     @SerialName("file_name") val fileName: String,
-    @SerialName("content_type") val contentType: String,
-    val title: String
+    val title: String,
+    /** Length in seconds. Documented field; omitting it may leave work unqueued. */
+    val duration: Long? = null,
+    /** ISO-8601 instant the audio was captured. */
+    @SerialName("recording_at") val recordingAt: String? = null
 )
 
 /**
@@ -288,14 +292,20 @@ object PocketClient {
 
     suspend fun createUpload(
         fileName: String,
-        contentType: String,
-        title: String
+        title: String,
+        durationSeconds: Long? = null,
+        recordedAt: String? = null
     ): UploadUrlResponse {
         check(API_KEY.isNotBlank() && !API_KEY.startsWith("pk_PASTE")) {
             "Pocket API key is not set"
         }
         val raw = api.createUploadUrl(
-            UploadUrlRequest(fileName = fileName, contentType = contentType, title = title)
+            UploadUrlRequest(
+                fileName = fileName,
+                title = title,
+                duration = durationSeconds,
+                recordingAt = recordedAt
+            )
         )
 
         // The field names and nesting depth of this response aren't documented,
@@ -320,14 +330,22 @@ object PocketClient {
         "presigned_url", "presignedurl", "url"
     )
 
-    private val STATUS_KEYS = listOf("status", "processing_status", "processingstatus", "state")
+    /**
+     * `state` is the recording's own status. `processing_status` is deliberately
+     * excluded — it belongs to the nested `translation` object, and a tree search
+     * would happily return that instead.
+     */
+    private val STATUS_KEYS = listOf("state", "status")
 
     private val TITLE_KEYS = listOf("recording_title", "recordingtitle", "title", "name")
 
-    /** `content` is where Pocket actually puts the generated summary. */
+    /**
+     * `summarizations` is where the recording-details endpoint puts the generated
+     * summary. `content` is the *search* endpoint's field name, kept as a fallback.
+     */
     private val SUMMARY_KEYS = listOf(
-        "summary", "ai_summary", "aisummary", "notes",
-        "content", "content_snippet", "contentsnippet", "markdown"
+        "summarizations", "summary", "ai_summary", "aisummary",
+        "notes", "content", "content_snippet", "contentsnippet", "markdown"
     )
 
     private val TRANSCRIPT_KEYS = listOf(
@@ -335,7 +353,10 @@ object PocketClient {
         "transcript_segments", "transcriptsegments"
     )
 
-    private val ERROR_KEYS = listOf("error_message", "errormessage", "error", "failure_reason")
+    private val ERROR_KEYS = listOf(
+        "transcript_error", "summarizations_errors",
+        "error_message", "errormessage", "error", "failure_reason"
+    )
 
     /** Depth-first search for the first non-null node under [key]. */
     private fun JsonElement.findNodeByKey(key: String): JsonElement? = when (this) {
@@ -489,6 +510,24 @@ object PocketClient {
         recordingId: String,
         timeoutMillis: Long = 6 * 60 * 1_000L,
         onStatus: (String) -> Unit = {}
+    ): RecordingResponse {
+        var lastSeen: RecordingResponse? = null
+
+        return try {
+            pollUntilReady(recordingId, timeoutMillis, onStatus) { lastSeen = it }
+        } catch (timeout: TimeoutCancellationException) {
+            // Summarization can be disabled on the account, in which case
+            // `summarizations` never populates. A transcript is still a result
+            // worth showing rather than failing the whole run.
+            lastSeen?.takeIf { !it.transcriptText.isNullOrBlank() } ?: throw timeout
+        }
+    }
+
+    private suspend fun pollUntilReady(
+        recordingId: String,
+        timeoutMillis: Long,
+        onStatus: (String) -> Unit,
+        onSnapshot: (RecordingResponse) -> Unit
     ): RecordingResponse = withTimeout(timeoutMillis) {
         var backoffMillis = 2_000L
         var result: RecordingResponse? = null
@@ -505,6 +544,7 @@ object PocketClient {
             }
 
             if (snapshot != null) {
+                onSnapshot(snapshot)
                 onStatus(snapshot.normalizedStatus)
 
                 if (snapshot.isFailed) {
