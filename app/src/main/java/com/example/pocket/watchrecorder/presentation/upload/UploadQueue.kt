@@ -5,7 +5,11 @@ import android.util.Log
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
-import java.time.Instant
+import java.time.Duration
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 /**
@@ -18,6 +22,18 @@ import java.util.UUID
  * recording behind. Writing [recordingId] down before the PUT starts is what
  * makes a retry resume rather than duplicate.
  */
+/** How `recording_at` is rendered on the wire. See [UploadQueue.recordedAtStamp]. */
+private enum class RecordedAtFormat {
+    /** "2026-09-11T15:28:00" — no zone marker. */
+    LOCAL_NAIVE,
+
+    /** "2026-09-11T15:28:00Z" — wall clock mislabelled as UTC. */
+    LOCAL_AS_UTC,
+
+    /** "2026-09-11T15:28:00-07:00" — genuinely correct instant. */
+    OFFSET
+}
+
 @Serializable
 data class QueuedUpload(
     val id: String,
@@ -74,6 +90,14 @@ class UploadQueue(private val context: Context) {
 
         /** Fallback lifetime when the API doesn't report expires_in. */
         const val DEFAULT_URL_LIFETIME_MS = 45 * 60 * 1_000L
+
+        /** See [recordedAtStamp]. */
+        private val RECORDED_AT_FORMAT = RecordedAtFormat.LOCAL_NAIVE
+
+        private val LOCAL_NAIVE_FORMAT: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
+        private val OFFSET_FORMAT: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX")
     }
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -106,12 +130,41 @@ class UploadQueue(private val context: Context) {
             fileName = target.name,
             title = title,
             durationSeconds = (durationMs / 1000).coerceAtLeast(1L),
-            recordedAt = Instant.now().minusMillis(durationMs).toString(),
+            recordedAt = recordedAtStamp(durationMs),
             queuedAtEpochMs = System.currentTimeMillis()
         )
         write(entry)
         Log.i(TAG, "Queued ${entry.id} (${target.length()} bytes)")
         return entry
+    }
+
+    /**
+     * Start time of a recording that just ended.
+     *
+     * Pocket displays `recording_at` without converting to local time, but it
+     * does store whatever instant the string resolves to. That makes the two
+     * obvious formats mutually exclusive:
+     *
+     *  - OFFSET      "…15:28:00-07:00" — instant correct, title reads 7h late
+     *  - LOCAL_AS_UTC "…15:28:00Z"     — title correct, instant 7h early
+     *
+     * LOCAL_NAIVE sends no zone marker at all, on the theory that Pocket takes
+     * an unqualified datetime at face value rather than shifting it. If that
+     * holds, both the title and the stored value are right.
+     */
+    private fun recordedAtStamp(durationMs: Long): String {
+        val startedAt = LocalDateTime.now(ZoneId.systemDefault())
+            .minus(Duration.ofMillis(durationMs))
+            .truncatedTo(ChronoUnit.SECONDS)
+
+        return when (RECORDED_AT_FORMAT) {
+            // Explicit formatters: LocalDateTime.toString() drops ":00" seconds,
+            // which a strict server-side parser may reject.
+            RecordedAtFormat.LOCAL_NAIVE -> startedAt.format(LOCAL_NAIVE_FORMAT)
+            RecordedAtFormat.LOCAL_AS_UTC -> startedAt.format(LOCAL_NAIVE_FORMAT) + "Z"
+            RecordedAtFormat.OFFSET ->
+                startedAt.atZone(ZoneId.systemDefault()).format(OFFSET_FORMAT)
+        }
     }
 
     fun update(entry: QueuedUpload) = write(entry)
@@ -139,10 +192,7 @@ class UploadQueue(private val context: Context) {
     /** Jobs whose bytes still need to reach S3. */
     fun awaitingUpload(): List<QueuedUpload> = all().filterNot { it.uploaded }
 
-    /** Jobs still needing an upload or a summary. */
-    fun unfinished(): List<QueuedUpload> = all().filterNot { it.isComplete }
 
-    fun oldest(): QueuedUpload? = all().firstOrNull()
 
     fun audioFile(entry: QueuedUpload): File? =
         File(dir, entry.fileName).takeIf { it.exists() && it.length() > 0L }
@@ -165,7 +215,4 @@ class UploadQueue(private val context: Context) {
         File(dir, id + SIDECAR_SUFFIX).delete()
     }
 
-    fun clear() {
-        dir.listFiles()?.forEach { runCatching { it.delete() } }
-    }
 }

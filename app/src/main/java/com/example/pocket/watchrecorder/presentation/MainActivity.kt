@@ -70,6 +70,7 @@ import androidx.wear.compose.material.VignettePosition
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.pocket.watchrecorder.audio.AudioRecorderManager
+import com.pocket.watchrecorder.audio.InsufficientStorageException
 import com.pocket.watchrecorder.network.API_KEY
 import com.pocket.watchrecorder.network.PocketClient
 import com.pocket.watchrecorder.network.PocketPipelineException
@@ -109,7 +110,8 @@ class MainActivity : ComponentActivity() {
 // ===========================================================================
 
 enum class Phase(val label: String) {
-    PROVISIONING("Preparing"),
+    // Provisioning lives inside UploadWorker now and is over in well under a
+    // second, so it no longer gets its own UI phase.
     UPLOADING("Uploading"),
     PROCESSING("Summarizing")
 }
@@ -325,6 +327,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private fun startRecording() {
         val file = try {
             recorder.start()
+        } catch (storage: InsufficientStorageException) {
+            Log.e(TAG, "Not enough space to record", storage)
+            _state.value = UiState.Failed(
+                "Storage full — ${storage.freeBytes / (1024 * 1024)} MB free",
+                canRetry = false
+            )
+            return
         } catch (t: Throwable) {
             Log.e(TAG, "Could not open the microphone", t)
             _state.value = UiState.Failed("Mic unavailable", canRetry = false)
@@ -358,7 +367,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
         val entry = queue.enqueue(
             audio = file,
-            title = "Watch Recording",
+            title = "Recording",  // local label only; Pocket supplies the real one
             durationMs = lastDurationMs
         )
         focusedId = entry.id
@@ -490,7 +499,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     )
 
     override fun onCleared() {
-        super.onCleared()
         meterJob?.cancel()
         recorder.cancel()
     }

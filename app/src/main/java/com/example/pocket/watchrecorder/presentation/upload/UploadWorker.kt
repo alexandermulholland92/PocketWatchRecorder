@@ -73,9 +73,6 @@ class UploadWorker(
                 .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request)
         }
 
-        fun cancel(context: Context) {
-            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
-        }
     }
 
     override suspend fun doWork(): Result {
@@ -109,7 +106,7 @@ class UploadWorker(
                 if (!current.hasUsableUrl) {
                     val provision = PocketClient.createUpload(
                         fileName = current.fileName.substringAfter('-'),
-                        title = current.title,
+                        // No title: Pocket names it from the transcript.
                         durationSeconds = current.durationSeconds,
                         recordedAt = current.recordedAt
                     )

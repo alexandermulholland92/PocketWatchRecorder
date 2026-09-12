@@ -5,6 +5,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.serializer
@@ -61,7 +62,7 @@ private const val BASE_URL = "https://public.heypocketai.com/"
  * route later needs no code change. Treat this file as secret while a literal
  * key is present: don't commit it, and rotate the key if it leaks.
  */
-private const val API_KEY_FALLBACK = "Your_API_Key_Here"
+private const val API_KEY_FALLBACK = "pk_PASTE_YOUR_KEY_HERE"
 
 val API_KEY: String = BuildConfig.POCKET_API_KEY
     .ifBlank { API_KEY_FALLBACK }
@@ -75,7 +76,12 @@ val API_KEY: String = BuildConfig.POCKET_API_KEY
 @Serializable
 data class UploadUrlRequest(
     @SerialName("file_name") val fileName: String,
-    val title: String,
+    /**
+     * Left null so Pocket titles the recording from its own transcript. The
+     * Json config uses encodeDefaults = false, so a null title is omitted from
+     * the request body entirely rather than sent as an empty string.
+     */
+    val title: String? = null,
     /** Length in seconds. Documented field; omitting it may leave work unqueued. */
     val duration: Long? = null,
     /** ISO-8601 instant the audio was captured. */
@@ -131,42 +137,62 @@ data class RecordingResponse(
         get() = normalizedStatus in READY_STATES || !summaryText.isNullOrBlank()
 
     val summaryText: String?
-        get() = flatten(summary) ?: flatten(notes)
+        get() = prose(summary) ?: prose(notes)
 
     val transcriptText: String?
-        get() = flatten(transcript)
+        get() = prose(transcript)
 
-    private companion object {
-        val READY_STATES = setOf("completed", "complete", "ready", "done", "processed", "success")
-        val FAILED_STATES = setOf("failed", "error", "errored", "rejected", "cancelled")
+    companion object {
+        private val READY_STATES =
+            setOf("completed", "complete", "ready", "done", "processed", "success")
+        private val FAILED_STATES =
+            setOf("failed", "error", "errored", "rejected", "cancelled")
 
-        /** Walks the common summary shapes down to plain text. */
-        fun flatten(element: JsonElement?): String? = when (element) {
+        /** Object keys that actually carry prose, in preference order. */
+        private val TEXT_KEYS = listOf("markdown", "text", "content", "summary", "body", "value")
+
+        private val UUID_RE =
+            Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        private val TIMESTAMP_RE =
+            Regex("^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})$")
+
+        /** Shorter than this is a status token, not a summary. */
+        private const val MIN_PROSE_CHARS = 12
+
+        /**
+         * Extracts readable text, and nothing else.
+         *
+         * Earlier this fell back to concatenating every value of an unrecognized
+         * object. While `summarizations` holds job metadata rather than a
+         * finished summary, that produced a wall of ids, webhook URLs and status
+         * tokens — and because the result was non-blank, isReady fired and
+         * polling stopped early. Objects are now read only through [TEXT_KEYS];
+         * anything else yields null and we keep waiting.
+         */
+        fun prose(element: JsonElement?): String? = when (element) {
             null -> null
-            is JsonPrimitive -> element.contentOrNullSafe()
+            is JsonPrimitive -> element.asProse()
             is JsonArray -> element
-                .mapNotNull { flatten(it) }
-                .filter { it.isNotBlank() }
+                .mapNotNull { prose(it) }
                 .joinToString("\n\n")
                 .takeIf { it.isNotBlank() }
 
-            is JsonObject -> {
-                val direct = listOf("text", "content", "summary", "body", "markdown", "value")
-                    .firstNotNullOfOrNull { key -> element[key]?.let(::flatten) }
-                direct ?: element.values
-                    .mapNotNull { flatten(it) }
-                    .filter { it.isNotBlank() }
-                    .joinToString("\n\n")
-                    .takeIf { it.isNotBlank() }
-            }
-
-            else -> null
+            is JsonObject -> TEXT_KEYS.firstNotNullOfOrNull { key -> element[key]?.let(::prose) }
         }
 
-        /** JsonNull is a JsonPrimitive whose unquoted content is literally "null". */
-        fun JsonPrimitive.contentOrNullSafe(): String? =
-            if (!isString && content == "null") null
-            else content.takeIf { it.isNotBlank() }
+        /** Filters out the scalars that show up in pipeline metadata. */
+        private fun JsonPrimitive.asProse(): String? {
+            if (!isString) return null                      // numbers, booleans, JsonNull
+            val value = content.trim()
+            return when {
+                value.length < MIN_PROSE_CHARS -> null      // "pending", "seed", "false"
+                UUID_RE.matches(value) -> null
+                TIMESTAMP_RE.matches(value) -> null
+                value.startsWith("http://", true) -> null
+                value.startsWith("https://", true) -> null
+                else -> value
+            }
+        }
     }
 }
 
@@ -226,7 +252,9 @@ object PocketClient {
      */
     private val s3Client: OkHttpClient by lazy {
         baseClient.newBuilder()
-            .writeTimeout(10, TimeUnit.MINUTES)
+            // Recording length is uncapped, so a single PUT can legitimately
+            // run for a long time on a slow link.
+            .writeTimeout(45, TimeUnit.MINUTES)
             .build()
     }
 
@@ -247,7 +275,8 @@ object PocketClient {
             annotations: Array<out Annotation>,
             retrofit: Retrofit
         ): Converter<ResponseBody, *> {
-            val loader = json.serializersModule.serializer(type)
+            @Suppress("UNCHECKED_CAST")
+            val loader = json.serializersModule.serializer(type) as KSerializer<Any?>
             return Converter<ResponseBody, Any?> { body ->
                 body.use { json.decodeFromString(loader, it.string()) }
             }
@@ -259,7 +288,8 @@ object PocketClient {
             methodAnnotations: Array<out Annotation>,
             retrofit: Retrofit
         ): Converter<*, RequestBody> {
-            val saver = json.serializersModule.serializer(type)
+            @Suppress("UNCHECKED_CAST")
+            val saver = json.serializersModule.serializer(type) as KSerializer<Any?>
             return Converter<Any?, RequestBody> { value ->
                 json.encodeToString(saver, value).toRequestBody(mediaType)
             }
@@ -292,7 +322,7 @@ object PocketClient {
 
     suspend fun createUpload(
         fileName: String,
-        title: String,
+        title: String? = null,
         durationSeconds: Long? = null,
         recordedAt: String? = null
     ): UploadUrlResponse {
@@ -396,10 +426,22 @@ object PocketClient {
         id = findString(ID_KEYS),
         status = findString(STATUS_KEYS),
         title = findString(TITLE_KEYS),
-        summary = findNode(SUMMARY_KEYS),
-        transcript = findNode(TRANSCRIPT_KEYS),
+        summary = findProse(SUMMARY_KEYS),
+        transcript = findProse(TRANSCRIPT_KEYS),
         errorMessage = findString(ERROR_KEYS)
     )
+
+    /**
+     * Like [findNode], but skips a key whose node holds no readable text.
+     *
+     * Matters because `summarizations` exists from the moment the job is
+     * created. Accepting it just for existing meant never falling through to
+     * a key that did have the text.
+     */
+    private fun JsonObject.findProse(keys: List<String>): JsonElement? =
+        keys.firstNotNullOfOrNull { key ->
+            findNodeByKey(key)?.takeIf { !RecordingResponse.prose(it).isNullOrBlank() }
+        }
 
     // -----------------------------------------------------------------------
     // Step 3: S3 PUT

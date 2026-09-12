@@ -22,6 +22,10 @@ import kotlin.math.log10
  * Not thread-safe: drive it from a single thread (the main thread is fine —
  * start/stop are fast).
  */
+/** Thrown when there isn't enough room to record safely. */
+class InsufficientStorageException(val freeBytes: Long) :
+    IllegalStateException("Only ${freeBytes / (1024 * 1024)} MB free")
+
 class AudioRecorderManager(private val context: Context) {
 
     companion object {
@@ -38,8 +42,13 @@ class AudioRecorderManager(private val context: Context) {
         /** MediaRecorder.stop() throws if the muxer never got a valid frame. */
         private const val MIN_VALID_DURATION_MS = 1_000L
 
-        private const val MAX_DURATION_MS = 30 * 60 * 1_000          // 30 min
-        private const val MAX_FILE_BYTES = 48L * 1024 * 1024         // 48 MB
+        /**
+         * Recording length is uncapped. The only limit left is free space, so
+         * we refuse to start below this rather than let MediaRecorder die
+         * mid-take — an MPEG-4 file whose moov atom was never written is not
+         * recoverable, and a long recording is a lot to lose that way.
+         */
+        private const val MIN_FREE_BYTES = 64L * 1024 * 1024         // 64 MB
 
         /** getMaxAmplitude() is 16-bit signed full scale. */
         private const val MAX_AMPLITUDE = 32_767f
@@ -75,6 +84,11 @@ class AudioRecorderManager(private val context: Context) {
     fun start(): File {
         check(recorder == null) { "start() called while already recording" }
 
+        val free = outputDir.usableSpace
+        if (free in 1 until MIN_FREE_BYTES) {
+            throw InsufficientStorageException(free)
+        }
+
         val file = File(outputDir, "watch_${timestamp()}.$FILE_EXTENSION")
         val newRecorder = createRecorder()
 
@@ -90,11 +104,6 @@ class AudioRecorderManager(private val context: Context) {
                 setAudioSamplingRate(SAMPLE_RATE_HZ)
                 setAudioEncodingBitRate(BIT_RATE_BPS)
                 setOutputFile(file.absolutePath)
-
-                // Guard rails. Some OEM recorders reject these; not worth failing over.
-                runCatching { setMaxDuration(MAX_DURATION_MS) }
-                runCatching { setMaxFileSize(MAX_FILE_BYTES) }
-
                 prepare()
                 start()
             }
@@ -133,9 +142,9 @@ class AudioRecorderManager(private val context: Context) {
             activeRecorder.release()
 
             val valid = file != null &&
-                file.exists() &&
-                file.length() > 0L &&
-                duration >= MIN_VALID_DURATION_MS
+                    file.exists() &&
+                    file.length() > 0L &&
+                    duration >= MIN_VALID_DURATION_MS
 
             if (valid) {
                 Log.i(TAG, "Stopped: ${file!!.length()} bytes / ${duration}ms")
