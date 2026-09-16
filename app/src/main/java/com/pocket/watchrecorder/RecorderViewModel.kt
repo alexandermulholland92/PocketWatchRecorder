@@ -205,7 +205,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             combine(queue.snapshots(), UploadProgress.state) { entries, _ -> entries }
                 .collect { entries ->
                     _library.value = entries.map { it.toItem() }
-                    entries.forEach { if (!it.isComplete) ensureTracked(it.id) }
+                    // Nothing left to follow for an entry that is finished or
+                    // has given up; re-tracking those would just spin a
+                    // coroutine per queue change for no result.
+                    entries.forEach {
+                        if (!it.isComplete && !it.isDeadLettered) ensureTracked(it.id)
+                    }
                 }
         }
 
@@ -342,7 +347,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             publish(entryId, UiState.Done(initial.summaryTitle, initial.summary.orEmpty()))
             return
         }
+        if (initial.isDeadLettered) {
+            publish(entryId, UiState.Failed(initial.lastError ?: "Upload failed", canRetry = true))
+            return
+        }
 
+        // Taken only once there is genuinely something to wait for, so a
+        // tracker that resolves immediately never holds one.
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
         wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
 
