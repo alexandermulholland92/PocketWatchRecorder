@@ -3,18 +3,16 @@ package com.pocket.watchrecorder.network
 import com.pocket.watchrecorder.BuildConfig
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.serializer
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.serializer
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Interceptor
@@ -24,8 +22,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.ResponseBody
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okio.Buffer
 import okio.BufferedSink
 import okio.source
@@ -42,7 +40,6 @@ import java.lang.reflect.Type
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -56,18 +53,22 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 private const val BASE_URL = "https://public.heypocketai.com/"
 
 /**
- * Paste your key here if the Gradle injection isn't working.
+ * The Pocket key, supplied at build time from `local.properties`.
  *
- * BuildConfig wins when it has a value, so restoring the local.properties
- * route later needs no code change. Treat this file as secret while a literal
- * key is present: don't commit it, and rotate the key if it leaks.
+ * There is deliberately no in-source fallback constant: the one that used to
+ * live here invited pasting a live key into a tracked file, which is exactly
+ * how this repository leaked one. Put the key in `local.properties`
+ * (see `local.properties.example`) and nowhere else.
+ *
+ * Note this still ships in the APK as a plaintext constant — fine for a
+ * personal sideload, not fine for a build you hand to someone else.
  */
-private const val API_KEY_FALLBACK = "pk_PASTE_YOUR_KEY_HERE"
-
-val API_KEY: String = BuildConfig.POCKET_API_KEY
-    .ifBlank { API_KEY_FALLBACK }
+internal val API_KEY: String = BuildConfig.POCKET_API_KEY
     .removePrefix("Bearer ")
     .trim()
+
+internal val isApiKeyConfigured: Boolean
+    get() = API_KEY.isNotBlank()
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -78,7 +79,7 @@ data class UploadUrlRequest(
     @SerialName("file_name") val fileName: String,
     /**
      * Left null so Pocket titles the recording from its own transcript. The
-     * Json config uses encodeDefaults = false, so a null title is omitted from
+     * Json config uses explicitNulls = false, so a null title is omitted from
      * the request body entirely rather than sent as an empty string.
      */
     val title: String? = null,
@@ -89,42 +90,34 @@ data class UploadUrlRequest(
 )
 
 /**
- * The provisioning response. Field names are modelled defensively: different
- * deployments of the Pocket public API have been seen returning either
- * `recording_id`/`upload_url` or `id`/`url`, so both are accepted and resolved
- * through [resolvedRecordingId] / [resolvedUploadUrl].
+ * A provisioned upload slot.
+ *
+ * Built by [toProvisionedUpload] from a tree search rather than by
+ * deserialization: the field names and nesting depth of the provisioning
+ * response vary between Pocket deployments.
  */
-@Serializable
-data class UploadUrlResponse(
-    @SerialName("recording_id") val recordingId: String? = null,
-    @SerialName("upload_url") val uploadUrl: String? = null,
-    val id: String? = null,
-    val url: String? = null,
-    @SerialName("expires_in") val expiresIn: Long? = null
-) {
-    val resolvedRecordingId: String?
-        get() = recordingId ?: id
-
-    val resolvedUploadUrl: String?
-        get() = uploadUrl ?: url
-}
+data class ProvisionedUpload(
+    val recordingId: String,
+    val uploadUrl: String,
+    /** Lifetime of [uploadUrl], when the API reports one. */
+    val expiresInSeconds: Long? = null
+)
 
 /**
- * The recording/status response. `summary`, `notes` and `transcript` are typed
- * as raw [JsonElement] because the pipeline returns them as a bare string in
- * some states and as a nested object/array in others. [summaryText] flattens
- * whichever shape came back.
+ * The recording/status response.
+ *
+ * `summary` and `transcript` are raw [JsonElement] because the pipeline returns
+ * them as a bare string in some states and as a nested object/array in others;
+ * [summaryText] flattens whichever shape came back. Built by hand from
+ * [toRecordingResponse], so it needs no serializer of its own.
  */
-@Serializable
 data class RecordingResponse(
     val id: String? = null,
-    @SerialName("recording_id") val recordingId: String? = null,
     val status: String? = null,
     val title: String? = null,
     val summary: JsonElement? = null,
-    val notes: JsonElement? = null,
     val transcript: JsonElement? = null,
-    @SerialName("error_message") val errorMessage: String? = null
+    val errorMessage: String? = null
 ) {
     val normalizedStatus: String
         get() = (status ?: "processing").lowercase()
@@ -137,7 +130,7 @@ data class RecordingResponse(
         get() = normalizedStatus in READY_STATES || !summaryText.isNullOrBlank()
 
     val summaryText: String?
-        get() = prose(summary) ?: prose(notes)
+        get() = prose(summary)
 
     val transcriptText: String?
         get() = prose(transcript)
@@ -147,57 +140,14 @@ data class RecordingResponse(
             setOf("completed", "complete", "ready", "done", "processed", "success")
         private val FAILED_STATES =
             setOf("failed", "error", "errored", "rejected", "cancelled")
-
-        /** Object keys that actually carry prose, in preference order. */
-        private val TEXT_KEYS = listOf("markdown", "text", "content", "summary", "body", "value")
-
-        private val UUID_RE =
-            Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-        private val TIMESTAMP_RE =
-            Regex("^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})$")
-
-        /** Shorter than this is a status token, not a summary. */
-        private const val MIN_PROSE_CHARS = 12
-
-        /**
-         * Extracts readable text, and nothing else.
-         *
-         * Earlier this fell back to concatenating every value of an unrecognized
-         * object. While `summarizations` holds job metadata rather than a
-         * finished summary, that produced a wall of ids, webhook URLs and status
-         * tokens — and because the result was non-blank, isReady fired and
-         * polling stopped early. Objects are now read only through [TEXT_KEYS];
-         * anything else yields null and we keep waiting.
-         */
-        fun prose(element: JsonElement?): String? = when (element) {
-            null -> null
-            is JsonPrimitive -> element.asProse()
-            is JsonArray -> element
-                .mapNotNull { prose(it) }
-                .joinToString("\n\n")
-                .takeIf { it.isNotBlank() }
-
-            is JsonObject -> TEXT_KEYS.firstNotNullOfOrNull { key -> element[key]?.let(::prose) }
-        }
-
-        /** Filters out the scalars that show up in pipeline metadata. */
-        private fun JsonPrimitive.asProse(): String? {
-            if (!isString) return null                      // numbers, booleans, JsonNull
-            val value = content.trim()
-            return when {
-                value.length < MIN_PROSE_CHARS -> null      // "pending", "seed", "false"
-                UUID_RE.matches(value) -> null
-                TIMESTAMP_RE.matches(value) -> null
-                value.startsWith("http://", true) -> null
-                value.startsWith("https://", true) -> null
-                else -> value
-            }
-        }
     }
 }
 
 /** Thrown when the pipeline itself reports a failure (as opposed to transport). */
 class PocketPipelineException(message: String) : IOException(message)
+
+/** Thrown when no API key was baked into the build. */
+class MissingApiKeyException : IOException("No Pocket API key in this build")
 
 // ---------------------------------------------------------------------------
 // Retrofit API
@@ -253,7 +203,9 @@ object PocketClient {
     private val s3Client: OkHttpClient by lazy {
         baseClient.newBuilder()
             // Recording length is uncapped, so a single PUT can legitimately
-            // run for a long time on a slow link.
+            // run for a long time on a slow link. UploadWorker promotes itself
+            // to a foreground service so this can outlast WorkManager's own
+            // execution budget.
             .writeTimeout(45, TimeUnit.MINUTES)
             .build()
     }
@@ -325,123 +277,18 @@ object PocketClient {
         title: String? = null,
         durationSeconds: Long? = null,
         recordedAt: String? = null
-    ): UploadUrlResponse {
-        check(API_KEY.isNotBlank() && !API_KEY.startsWith("pk_PASTE")) {
-            "Pocket API key is not set"
-        }
-        val raw = api.createUploadUrl(
+    ): ProvisionedUpload {
+        if (!isApiKeyConfigured) throw MissingApiKeyException()
+
+        return api.createUploadUrl(
             UploadUrlRequest(
                 fileName = fileName,
                 title = title,
                 duration = durationSeconds,
                 recordingAt = recordedAt
             )
-        )
-
-        // The field names and nesting depth of this response aren't documented,
-        // so search the whole tree rather than assuming a flat shape.
-        val id = raw.findString(ID_KEYS)
-        val url = raw.findString(URL_KEYS) { it.startsWith("http", ignoreCase = true) }
-
-        requireNotNull(id) { "No recording id. Got: ${raw.describeKeys().take(110)}" }
-        requireNotNull(url) { "No upload url. Got: ${raw.describeKeys().take(110)}" }
-
-        return UploadUrlResponse(recordingId = id, uploadUrl = url)
+        ).toProvisionedUpload()
     }
-
-    // Pocket wraps every response in {"success": ..., "data": {...}} and uses
-    // camelCase field names, so each lookup searches the whole tree. Key lists
-    // are in priority order: the first one that resolves anywhere wins.
-
-    private val ID_KEYS = listOf("recording_id", "recordingid", "id", "uuid")
-
-    private val URL_KEYS = listOf(
-        "upload_url", "uploadurl", "signed_url", "signedurl",
-        "presigned_url", "presignedurl", "url"
-    )
-
-    /**
-     * `state` is the recording's own status. `processing_status` is deliberately
-     * excluded — it belongs to the nested `translation` object, and a tree search
-     * would happily return that instead.
-     */
-    private val STATUS_KEYS = listOf("state", "status")
-
-    private val TITLE_KEYS = listOf("recording_title", "recordingtitle", "title", "name")
-
-    /**
-     * `summarizations` is where the recording-details endpoint puts the generated
-     * summary. `content` is the *search* endpoint's field name, kept as a fallback.
-     */
-    private val SUMMARY_KEYS = listOf(
-        "summarizations", "summary", "ai_summary", "aisummary",
-        "notes", "content", "content_snippet", "contentsnippet", "markdown"
-    )
-
-    private val TRANSCRIPT_KEYS = listOf(
-        "transcript", "transcript_text", "transcripttext",
-        "transcript_segments", "transcriptsegments"
-    )
-
-    private val ERROR_KEYS = listOf(
-        "transcript_error", "summarizations_errors",
-        "error_message", "errormessage", "error", "failure_reason"
-    )
-
-    /** Depth-first search for the first non-null node under [key]. */
-    private fun JsonElement.findNodeByKey(key: String): JsonElement? = when (this) {
-        is JsonObject -> entries.firstNotNullOfOrNull { (name, value) ->
-            if (name.lowercase().replace('-', '_') == key && value !is JsonNull) value else null
-        } ?: entries.firstNotNullOfOrNull { (_, value) -> value.findNodeByKey(key) }
-
-        is JsonArray -> firstNotNullOfOrNull { it.findNodeByKey(key) }
-        else -> null
-    }
-
-    private fun JsonElement.findNode(keys: List<String>): JsonElement? =
-        keys.firstNotNullOfOrNull { findNodeByKey(it) }
-
-    private fun JsonElement.findString(
-        keys: List<String>,
-        predicate: (String) -> Boolean = { true }
-    ): String? = keys.firstNotNullOfOrNull { key ->
-        (findNodeByKey(key) as? JsonPrimitive)
-            ?.takeIf { it.isString && it.content.isNotBlank() }
-            ?.content
-            ?.takeIf(predicate)
-    }
-
-    /** Compact key outline, so an unexpected shape is legible on a watch. */
-    private fun JsonObject.describeKeys(depth: Int = 2): String =
-        entries.joinToString(", ") { (key, value) ->
-            when {
-                value is JsonObject && depth > 0 -> "$key{${value.describeKeys(depth - 1)}}"
-                value is JsonArray && depth > 0 -> "$key[]"
-                else -> key
-            }
-        }
-
-    /** Maps the enveloped status payload onto the typed model. */
-    private fun JsonObject.toRecordingResponse(): RecordingResponse = RecordingResponse(
-        id = findString(ID_KEYS),
-        status = findString(STATUS_KEYS),
-        title = findString(TITLE_KEYS),
-        summary = findProse(SUMMARY_KEYS),
-        transcript = findProse(TRANSCRIPT_KEYS),
-        errorMessage = findString(ERROR_KEYS)
-    )
-
-    /**
-     * Like [findNode], but skips a key whose node holds no readable text.
-     *
-     * Matters because `summarizations` exists from the moment the job is
-     * created. Accepting it just for existing meant never falling through to
-     * a key that did have the text.
-     */
-    private fun JsonObject.findProse(keys: List<String>): JsonElement? =
-        keys.firstNotNullOfOrNull { key ->
-            findNodeByKey(key)?.takeIf { !RecordingResponse.prose(it).isNullOrBlank() }
-        }
 
     // -----------------------------------------------------------------------
     // Step 3: S3 PUT
@@ -580,7 +427,10 @@ object PocketClient {
             } catch (http: HttpException) {
                 when (http.code()) {
                     404, 409, 425 -> null            // still landing; keep waiting
-                    401, 403 -> throw PocketPipelineException("Authorization rejected (HTTP ${http.code()})")
+                    401, 403 -> throw PocketPipelineException(
+                        "Authorization rejected (HTTP ${http.code()})"
+                    )
+
                     else -> throw http
                 }
             }

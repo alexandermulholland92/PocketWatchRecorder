@@ -1,6 +1,10 @@
 package com.pocket.watchrecorder.upload
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
@@ -9,18 +13,22 @@ import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.pocket.watchrecorder.R
 import com.pocket.watchrecorder.audio.AudioRecorderManager
+import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import retrofit2.HttpException
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -42,6 +50,9 @@ class UploadWorker(
         const val WORK_NAME = "pocket-upload-queue"
         const val KEY_PROGRESS = "progress_percent"
 
+        private const val CHANNEL_ID = "uploads"
+        private const val NOTIFICATION_ID = 1002
+
         /**
          * Above this size, refuse to start on a very slow link.
          *
@@ -53,8 +64,6 @@ class UploadWorker(
          */
         private const val LARGE_FILE_BYTES = 512L * 1024
         private const val MIN_UPSTREAM_KBPS_FOR_LARGE = 400
-
-        private const val MAX_ATTEMPTS = 5
 
         fun schedule(context: Context) {
             val request = OneTimeWorkRequestBuilder<UploadWorker>()
@@ -72,16 +81,22 @@ class UploadWorker(
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request)
         }
-
     }
 
-    override suspend fun doWork(): Result {
-        val queue = UploadQueue(applicationContext)
-        val pending = queue.awaitingUpload()
+    private val queue = UploadQueue(applicationContext)
 
+    override suspend fun doWork(): Result {
+        val pending = queue.awaitingUpload()
         if (pending.isEmpty()) return Result.success()
 
-        var deferredForBandwidth = false
+        // Promote to a foreground service. Without this the worker is capped at
+        // roughly ten minutes, which a large recording on the Bluetooth proxy
+        // can exceed — it would be stopped mid-PUT and restart from zero, every
+        // time, forever.
+        runCatching { setForeground(getForegroundInfo()) }
+            .onFailure { Log.w(TAG, "Continuing without foreground promotion", it) }
+
+        var needsAnotherPass = false
 
         for (entry in pending) {
             if (isStopped) return Result.retry()
@@ -95,7 +110,7 @@ class UploadWorker(
 
             if (!linkCanCarry(audio.length())) {
                 Log.i(TAG, "Deferring ${entry.id}: link too slow for ${audio.length()} bytes")
-                deferredForBandwidth = true
+                needsAnotherPass = true
                 continue
             }
 
@@ -110,12 +125,12 @@ class UploadWorker(
                         durationSeconds = current.durationSeconds,
                         recordedAt = current.recordedAt
                     )
-                    val lifetime = (provision.expiresIn?.times(1_000L))
+                    val lifetime = provision.expiresInSeconds?.times(1_000L)
                         ?: UploadQueue.DEFAULT_URL_LIFETIME_MS
 
                     current = current.copy(
-                        recordingId = provision.resolvedRecordingId,
-                        uploadUrl = provision.resolvedUploadUrl,
+                        recordingId = provision.recordingId,
+                        uploadUrl = provision.uploadUrl,
                         urlExpiresAtEpochMs = System.currentTimeMillis() +
                                 lifetime - UploadQueue.URL_SAFETY_MARGIN_MS
                     )
@@ -132,6 +147,10 @@ class UploadWorker(
                     file = audio,
                     contentType = AudioRecorderManager.CONTENT_TYPE
                 ) { fraction ->
+                    // Noticed on the very next chunk rather than only between
+                    // entries, so a stop doesn't keep streaming bytes.
+                    if (isStopped) throw IOException("Worker stopped")
+
                     // Every tick goes to the UI...
                     UploadProgress.report(current.id, fraction, totalBytes)
 
@@ -152,18 +171,28 @@ class UploadWorker(
                 throw cancelled
             } catch (t: Throwable) {
                 UploadProgress.clear(entry.id)
+
+                if (isStopped) {
+                    // We were stopped mid-transfer. Not this entry's fault, so
+                    // don't spend one of its attempts on it.
+                    return Result.retry()
+                }
+
                 val attempts = entry.attempts + 1
-                val message = t.shortMessage()
-                queue.update(entry.copy(attempts = attempts, lastError = message))
+                queue.update(entry.copy(attempts = attempts, lastError = t.shortMessage()))
                 Log.e(TAG, "Upload failed for ${entry.id} (attempt $attempts)", t)
 
-                if (attempts >= MAX_ATTEMPTS || t.isPermanent()) return Result.failure()
-                return Result.retry()
+                // Move on to the next entry rather than abandoning the run.
+                // Returning here meant one exhausted entry at the head of the
+                // queue blocked every later recording indefinitely.
+                if (attempts < UploadQueue.MAX_ATTEMPTS && !t.isPermanent()) {
+                    needsAnotherPass = true
+                }
             }
         }
 
         // Anything added while we were running, or deferred above, gets another pass.
-        return if (deferredForBandwidth || queue.awaitingUpload().isNotEmpty()) {
+        return if (needsAnotherPass || queue.awaitingUpload().isNotEmpty()) {
             Result.retry()
         } else {
             Result.success()
@@ -190,12 +219,47 @@ class UploadWorker(
         return capabilities.linkUpstreamBandwidthKbps >= MIN_UPSTREAM_KBPS_FOR_LARGE
     }
 
-    private fun Throwable.isPermanent(): Boolean =
-        this is HttpException && code() in 400..499 && code() !in setOf(408, 425, 429)
+    /** A missing key or a 4xx will not fix itself; everything else might. */
+    private fun Throwable.isPermanent(): Boolean = when (this) {
+        is MissingApiKeyException -> true
+        is HttpException -> code() in 400..499 && code() !in setOf(408, 425, 429)
+        else -> false
+    }
 
     private fun Throwable.shortMessage(): String = when (this) {
+        is MissingApiKeyException -> "No API key"
         is HttpException -> "HTTP ${code()}"
         else -> this::class.java.simpleName + (message?.let { ": ${it.take(50)}" } ?: "")
+    }
+
+    // -----------------------------------------------------------------------
+    // Foreground notification
+    // -----------------------------------------------------------------------
+
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            applicationContext.getString(R.string.upload_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = applicationContext.getString(R.string.upload_channel_description)
+            setShowBadge(false)
+        }
+        applicationContext.getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
+
+        val notification = Notification.Builder(applicationContext, CHANNEL_ID)
+            .setContentTitle(applicationContext.getString(R.string.upload_notification_title))
+            .setSmallIcon(R.drawable.ic_stat_mic)
+            .setOngoing(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .build()
+
+        return ForegroundInfo(
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        )
     }
 }
 

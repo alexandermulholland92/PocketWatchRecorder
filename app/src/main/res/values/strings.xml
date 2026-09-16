@@ -1,4 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Pocket</string>
+
+    <string name="recording_channel_name">Recording</string>
+    <string name="recording_channel_description">Shown while the microphone is in use.</string>
+    <string name="recording_notification_title">Recording</string>
+    <string name="recording_notification_text">Tap to open Pocket</string>
+
+    <string name="upload_channel_name">Uploads</string>
+    <string name="upload_channel_description">Shown while a recording is being sent to Pocket.</string>
+    <string name="upload_notification_title">Uploading recording</string>
 </resources>

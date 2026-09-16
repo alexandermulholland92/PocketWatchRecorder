@@ -1,15 +1,28 @@
 *.iml
 .gradle
-/local.properties
+/build
+/captures
+.externalNativeBuild
+.cxx
+.DS_Store
+
+# Never commit: holds the local SDK path and the Pocket API key.
+# See local.properties.example for the keys it needs.
+local.properties
+
+# Machine-specific IDE state. The rest of .idea/ (code style, inspections)
+# is shared on purpose.
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
 /.idea/workspace.xml
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
-local.properties
+/.idea/deploymentTargetSelector.xml
+/.idea/gradle.xml
+/.idea/runConfigurations.xml
+/.idea/misc.xml
+
+# Release signing material, if you set it up.
+*.jks
+*.keystore
