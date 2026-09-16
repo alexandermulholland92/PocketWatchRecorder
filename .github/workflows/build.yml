@@ -26,6 +26,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The runner image already ships the SDK; this step is only here to
+          # accept licenses. Left at its default it tries to install the
+          # long-obsolete "tools" package, which no longer exists.
+          packages: ''
+          log-accepted-android-sdk-licenses: false
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
