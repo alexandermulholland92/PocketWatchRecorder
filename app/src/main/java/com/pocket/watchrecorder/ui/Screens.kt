@@ -19,6 +19,7 @@ import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.CircularProgressIndicator
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
+import com.pocket.watchrecorder.ApiKeyState
 import com.pocket.watchrecorder.ItemStatus
 import com.pocket.watchrecorder.QueueItem
 import com.pocket.watchrecorder.UiState
@@ -48,21 +49,50 @@ internal fun PermissionScreen(denied: Boolean, onGrant: () -> Unit) {
 }
 
 @Composable
-internal fun IdleScreen(queuedCount: Int, onStart: () -> Unit, onOpenLibrary: () -> Unit) {
+internal fun IdleScreen(
+    queuedCount: Int,
+    keyState: ApiKeyState,
+    onStart: () -> Unit,
+    onOpenLibrary: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    val keyMissing = keyState == ApiKeyState.MISSING
+
     CenteredColumn {
         Text(text = "Pocket", style = MaterialTheme.typography.title2)
         Text(
-            text = "Tap to record",
+            text = if (keyMissing) "No key — uploads off" else "Tap to record",
             style = MaterialTheme.typography.caption1,
-            color = MaterialTheme.colors.onSurfaceVariant,
+            color = if (keyMissing) {
+                MaterialTheme.colors.error
+            } else {
+                MaterialTheme.colors.onSurfaceVariant
+            },
             modifier = Modifier.padding(top = 2.dp, bottom = 12.dp)
         )
         RecordButton(recording = false, level = 0f, onClick = onStart)
 
-        if (queuedCount > 0) {
+        // Surfaced on the first screen rather than buried: without a key the
+        // app records happily and then fails every upload, which is a
+        // confusing way to find out.
+        if (keyMissing) {
+            Chip(
+                label = { Text("Add your key") },
+                onClick = onOpenSettings,
+                colors = ChipDefaults.primaryChipColors(),
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        } else if (queuedCount > 0) {
             Chip(
                 label = { Text("$queuedCount in queue") },
                 onClick = onOpenLibrary,
+                colors = ChipDefaults.secondaryChipColors(),
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        } else {
+            Chip(
+                label = { Text("Settings") },
+                onClick = onOpenSettings,
                 colors = ChipDefaults.secondaryChipColors(),
                 modifier = Modifier.padding(top = 10.dp)
             )
@@ -352,5 +382,97 @@ internal fun FailedScreen(
             colors = ChipDefaults.secondaryChipColors(),
             modifier = Modifier.padding(top = 6.dp)
         )
+    }
+}
+
+@Composable
+internal fun SettingsScreen(
+    keyState: ApiKeyState,
+    listState: ScalingLazyListState,
+    onEnterKey: () -> Unit,
+    onClearKey: () -> Unit,
+    onBack: () -> Unit
+) {
+    ScalingLazyColumn(
+        state = listState,
+        modifier = Modifier
+            .fillMaxSize()
+            .then(rememberRotaryScroll(listState)),
+        anchorType = ScalingLazyListAnchorType.ItemStart,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 30.dp)
+    ) {
+        item {
+            Text(
+                text = "Pocket key",
+                style = MaterialTheme.typography.title3,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
+
+        item {
+            Text(
+                text = when (keyState) {
+                    ApiKeyState.ON_DEVICE -> "Saved on this watch"
+                    ApiKeyState.FROM_BUILD -> "Using the key built into this app"
+                    ApiKeyState.MISSING -> "Not set — uploads will fail"
+                    ApiKeyState.STORAGE_FAILED -> "Could not be saved on this watch"
+                },
+                style = MaterialTheme.typography.caption1,
+                color = when (keyState) {
+                    ApiKeyState.MISSING, ApiKeyState.STORAGE_FAILED -> MaterialTheme.colors.error
+                    else -> MaterialTheme.colors.onSurfaceVariant
+                },
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+        }
+
+        item {
+            Chip(
+                label = {
+                    Text(if (keyState == ApiKeyState.ON_DEVICE) "Replace key" else "Enter key")
+                },
+                onClick = onEnterKey,
+                colors = ChipDefaults.primaryChipColors(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp)
+            )
+        }
+
+        if (keyState == ApiKeyState.ON_DEVICE) {
+            item {
+                Chip(
+                    label = { Text("Remove key") },
+                    onClick = onClearKey,
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp)
+                )
+            }
+        }
+
+        item {
+            Text(
+                text = "Entering it here keeps the key off every build of the app.",
+                style = MaterialTheme.typography.caption2,
+                color = MaterialTheme.colors.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+
+        item {
+            Chip(
+                label = { Text("Back") },
+                onClick = onBack,
+                colors = ChipDefaults.secondaryChipColors(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp)
+            )
+        }
     }
 }

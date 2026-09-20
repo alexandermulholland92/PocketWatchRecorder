@@ -29,6 +29,7 @@ import androidx.wear.compose.material.Scaffold
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.Vignette
 import androidx.wear.compose.material.VignettePosition
+import com.pocket.watchrecorder.ApiKeyState
 import com.pocket.watchrecorder.ItemStatus
 import com.pocket.watchrecorder.QueueItem
 import com.pocket.watchrecorder.RecorderViewModel
@@ -60,6 +61,7 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val library by viewModel.library.collectAsStateWithLifecycle()
     val route by viewModel.route.collectAsStateWithLifecycle()
+    val keyState by viewModel.apiKeyState.collectAsStateWithLifecycle()
 
     var hasMicPermission by remember { mutableStateOf(context.hasMicPermission()) }
     var permissionRequested by remember { mutableStateOf(false) }
@@ -79,6 +81,8 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
     // off because RecordingService holds the microphone as a foreground
     // service, and uploads survive it because UploadWorker promotes itself the
     // same way. Forcing the display on was a workaround for neither being true.
+
+    val enterApiKey = rememberApiKeyEntry(onEntered = viewModel::saveApiKey)
 
     val listState = rememberScalingLazyListState()
     val currentRoute = route
@@ -111,6 +115,14 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
                         onBack = viewModel::backToMain
                     )
 
+                    currentRoute is Route.Settings -> SettingsScreen(
+                        keyState = keyState,
+                        listState = listState,
+                        onEnterKey = enterApiKey,
+                        onClearKey = viewModel::clearApiKey,
+                        onBack = viewModel::backToMain
+                    )
+
                     currentRoute is Route.Detail -> {
                         val item = library.firstOrNull { it.id == currentRoute.id }
                         SummaryScreen(
@@ -125,6 +137,7 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
                     else -> MainRoute(
                         state = state,
                         library = library,
+                        keyState = keyState,
                         listState = listState,
                         viewModel = viewModel
                     )
@@ -138,6 +151,7 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
 private fun MainRoute(
     state: UiState,
     library: List<QueueItem>,
+    keyState: ApiKeyState,
     listState: ScalingLazyListState,
     viewModel: RecorderViewModel
 ) {
@@ -148,8 +162,10 @@ private fun MainRoute(
     when (state) {
         is UiState.Idle -> IdleScreen(
             queuedCount = library.size,
+            keyState = keyState,
             onStart = viewModel::onPrimaryAction,
-            onOpenLibrary = viewModel::openLibrary
+            onOpenLibrary = viewModel::openLibrary,
+            onOpenSettings = viewModel::openSettings
         )
 
         is UiState.Recording -> RecordingScreen(

@@ -10,16 +10,42 @@ your own API key.
 2. Fill in `sdk.dir` and `POCKET_API_KEY`.
 3. `./gradlew installDebug` with a watch (or Wear emulator) attached.
 
-`local.properties` is gitignored and must stay that way — it holds your key.
-You can also `export POCKET_API_KEY=...` instead of putting it in the file.
+`local.properties` is gitignored and must stay that way. You can also
+`export POCKET_API_KEY=...` instead of putting it in the file.
+
+### Or set the key on the watch
+
+A build-time key is optional. **Settings → Pocket key → Enter key** stores it
+encrypted on the device (AES-GCM under a hardware-backed Keystore key), and a
+key entered there takes precedence over anything baked in.
+
+Prefer this for any build you publish. A key baked in at build time ships in
+the APK as a plaintext constant, so the APK becomes a credential: you cannot
+put it in a GitHub release, hand it to anyone, or rotate without rebuilding.
 
 > **Upgrading from before this branch: your key is gone.** `local.properties`
 > used to be tracked, and `PocketNetwork.kt` used to carry an `API_KEY_FALLBACK`
 > constant you could paste a key into. Both are removed, so pulling this branch
-> takes your key out of the build and every upload fails with
-> "No API key in this build". Recreate `local.properties` as above. Gradle now
-> prints a loud warning at build time when the key is missing or still a
-> placeholder, rather than letting you find out on the watch.
+> takes your key out of the build. Either recreate `local.properties` as above,
+> or set the key on the watch.
+
+## Getting an APK onto your watch
+
+**Actions → APK → Run workflow** builds one and attaches it to a prerelease, so
+you get a direct `.apk` link you can open on your phone.
+
+| Input | Use |
+|---|---|
+| `variant` | `debug` needs no setup and installs straight away. `release` is smaller and R8-shrunk, but needs signing secrets (the workflow tells you which). |
+| `publish` | `release` gives a direct `.apk` URL. `artifact` gives a zip. |
+| `bake_api_key` | Leave off. On it puts your key in the APK, and anyone who can download the APK can read it. |
+
+The debug signing key is cached between runs, so successive builds install over
+each other instead of failing with "app not installed".
+
+This is a **watch** app — it declares `android.hardware.type.watch` as required,
+so it will not install on a phone. Download it on the phone, then push it to the
+watch with ADB over Wi-Fi or a sideloading app.
 
 > **If you cloned this before the key was removed:** the repository's history
 > contains a real `pk_...` key. Rotate it in Pocket. Deleting the file from the

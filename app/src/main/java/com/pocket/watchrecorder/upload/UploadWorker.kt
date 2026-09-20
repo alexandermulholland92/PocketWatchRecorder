@@ -260,9 +260,8 @@ class UploadWorker(
     }
 
     private fun Throwable.shortMessage(): String = when (this) {
-        // Persisted, so this is what the failure screen shows. Worth spelling
-        // out: the fix is in the build, not on the watch.
-        is MissingApiKeyException -> "No API key in this build"
+        // Persisted, so this is what the failure screen shows.
+        is MissingApiKeyException -> "No API key — see Settings"
         is HttpException -> "HTTP ${code()}"
         else -> this::class.java.simpleName + (message?.let { ": ${it.take(50)}" } ?: "")
     }

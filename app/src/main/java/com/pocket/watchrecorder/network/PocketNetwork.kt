@@ -53,17 +53,18 @@ import kotlin.coroutines.resumeWithException
 private const val BASE_URL = "https://public.heypocketai.com/"
 
 /**
- * The Pocket key, supplied at build time from `local.properties` or the
- * POCKET_API_KEY environment variable.
+ * A key baked in at build time from `local.properties` or the POCKET_API_KEY
+ * environment variable.
+ *
+ * Optional, and only a fallback now: it ships in the APK as a plaintext
+ * constant, so any build that carries one is itself a credential. Prefer
+ * entering the key on the watch, which keeps it off every artifact.
  *
  * There is deliberately no in-source fallback constant: the one that used to
  * live here invited pasting a live key into a tracked file, which is exactly
  * how this repository leaked one.
- *
- * Note this still ships in the APK as a plaintext constant — fine for a
- * personal sideload, not fine for a build you hand to someone else.
  */
-internal val API_KEY: String = BuildConfig.POCKET_API_KEY
+private val BUILD_TIME_API_KEY: String = BuildConfig.POCKET_API_KEY
     .removePrefix("Bearer ")
     .trim()
 
@@ -86,8 +87,53 @@ internal fun isUsableApiKey(key: String): Boolean {
     return normalized.isNotEmpty() && PLACEHOLDER_KEY_MARKERS.none { normalized.contains(it) }
 }
 
+/**
+ * Where the Pocket key comes from at runtime.
+ *
+ * A key entered on the watch wins over one baked into the build. That ordering
+ * is what lets a published APK carry no secret at all while a locally built one
+ * keeps working exactly as before.
+ */
+object PocketCredentials {
+
+    @Volatile
+    private var store: ApiKeyStore? = null
+
+    @Volatile
+    private var entered: String? = null
+
+    /** Called once, from [com.pocket.watchrecorder.PocketApplication]. */
+    fun bind(keyStore: ApiKeyStore) {
+        store = keyStore
+        entered = keyStore.read()
+    }
+
+    /** Stores [key] on the device. Returns false if it could not be written. */
+    fun set(key: String): Boolean {
+        val trimmed = key.trim().removePrefix("Bearer ").trim()
+        val written = store?.write(trimmed) ?: false
+        if (written) entered = trimmed
+        return written
+    }
+
+    fun clear() {
+        store?.clear()
+        entered = null
+    }
+
+    /** True when a key was entered on this watch, as opposed to built in. */
+    val isDeviceKey: Boolean
+        get() = isUsableApiKey(entered.orEmpty())
+
+    val current: String
+        get() = entered?.takeIf { isUsableApiKey(it) } ?: BUILD_TIME_API_KEY
+
+    val isConfigured: Boolean
+        get() = isUsableApiKey(current)
+}
+
 internal val isApiKeyConfigured: Boolean
-    get() = isUsableApiKey(API_KEY)
+    get() = PocketCredentials.isConfigured
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -173,7 +219,7 @@ class PocketPipelineException(message: String) : IOException(message)
  * rather than anything the user can do on the watch.
  */
 class MissingApiKeyException :
-    IOException("No Pocket API key in this build — set POCKET_API_KEY in local.properties")
+    IOException("No Pocket API key — set one on the watch, or in local.properties")
 
 // ---------------------------------------------------------------------------
 // Retrofit API
@@ -286,8 +332,10 @@ object PocketClient {
 
     private object AuthInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
+            // Read per request: the key can be entered or changed on the
+            // watch while the process is alive.
             val request = chain.request().newBuilder()
-                .header("Authorization", "Bearer $API_KEY")
+                .header("Authorization", "Bearer ${PocketCredentials.current}")
                 .header("Accept", "application/json")
                 .build()
             return chain.proceed(request)

@@ -12,6 +12,7 @@ import com.pocket.watchrecorder.audio.RecordingBus
 import com.pocket.watchrecorder.audio.RecordingService
 import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
+import com.pocket.watchrecorder.network.PocketCredentials
 import com.pocket.watchrecorder.network.PocketPipelineException
 import com.pocket.watchrecorder.upload.QueuedUpload
 import com.pocket.watchrecorder.upload.UploadProgress
@@ -66,6 +67,21 @@ sealed interface UiState {
     data class Failed(val message: String, val canRetry: Boolean) : UiState
 }
 
+/** Where the Pocket key is coming from, for the settings screen. */
+enum class ApiKeyState {
+    /** Entered on this watch and stored encrypted. */
+    ON_DEVICE,
+
+    /** Baked into the APK at build time. Works, but ships in the artifact. */
+    FROM_BUILD,
+
+    /** Nothing usable. Recording works; uploads will not. */
+    MISSING,
+
+    /** The Keystore refused to store it. */
+    STORAGE_FAILED
+}
+
 enum class ItemStatus(val label: String) {
     WAITING("Waiting"),
     UPLOADING("Uploading"),
@@ -87,6 +103,7 @@ data class QueueItem(
 sealed interface Route {
     data object Main : Route
     data object Library : Route
+    data object Settings : Route
     data class Detail(val id: String) : Route
 }
 
@@ -139,6 +156,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     private val _route = MutableStateFlow<Route>(Route.Main)
     val route: StateFlow<Route> = _route.asStateFlow()
+
+    private val _apiKeyState = MutableStateFlow(readApiKeyState())
+    val apiKeyState: StateFlow<ApiKeyState> = _apiKeyState.asStateFlow()
 
     /** One tracker per queue entry, keyed by entry id. */
     private val trackers = mutableMapOf<String, Job>()
@@ -245,6 +265,48 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun openLibrary() {
         _route.value = Route.Library
+    }
+
+    fun openSettings() {
+        _apiKeyState.value = readApiKeyState()
+        _route.value = Route.Settings
+    }
+
+    // -----------------------------------------------------------------------
+    // API key
+    // -----------------------------------------------------------------------
+
+    /**
+     * Stores a key entered on the watch.
+     *
+     * Also clears the error on anything that failed while there was no key and
+     * kicks the queue, so recordings made before the key was set go up straight
+     * away instead of waiting for the user to find them in the library.
+     */
+    fun saveApiKey(key: String) {
+        if (!PocketCredentials.set(key)) {
+            _apiKeyState.value = ApiKeyState.STORAGE_FAILED
+            return
+        }
+        _apiKeyState.value = readApiKeyState()
+
+        viewModelScope.launch {
+            queue.all()
+                .filter { !it.uploaded && it.lastError != null }
+                .forEach { queue.update(it.copy(attempts = 0, lastError = null, deferrals = 0)) }
+            UploadWorker.scheduleNow(getApplication())
+        }
+    }
+
+    fun clearApiKey() {
+        PocketCredentials.clear()
+        _apiKeyState.value = readApiKeyState()
+    }
+
+    private fun readApiKeyState(): ApiKeyState = when {
+        PocketCredentials.isDeviceKey -> ApiKeyState.ON_DEVICE
+        PocketCredentials.isConfigured -> ApiKeyState.FROM_BUILD
+        else -> ApiKeyState.MISSING
     }
 
     fun openDetail(id: String) {
@@ -478,7 +540,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
      * which is where it now goes.
      */
     private fun Throwable.toUserMessage(): String = when (this) {
-        is MissingApiKeyException -> "No API key in this build"
+        is MissingApiKeyException -> "No API key — add it in Settings"
         is UnknownHostException -> "No connection"
         is SocketTimeoutException -> "Network timed out"
         is PocketPipelineException -> message ?: "Processing failed"

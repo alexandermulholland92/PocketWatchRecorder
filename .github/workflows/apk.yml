@@ -1,0 +1,169 @@
+name: APK
+
+# Run this by hand: Actions → APK → Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'debug (installs anywhere, no setup) or release (smaller, needs signing secrets)'
+        type: choice
+        options: [debug, release]
+        default: debug
+      publish:
+        description: 'release = a direct .apk link you can open on your phone; artifact = a zip'
+        type: choice
+        options: [release, artifact]
+        default: release
+      bake_api_key:
+        description: 'Bake the POCKET_API_KEY secret into the APK. Leave off and enter the key on the watch instead.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+          log-accepted-android-sdk-licenses: false
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Keeps the debug signing identity stable between runs. Without this a
+      # fresh keystore is generated every build, every APK is signed by a
+      # different identity, and the watch refuses to install over the last one
+      # ("app not installed") until you uninstall first.
+      - name: Cache the debug signing key
+        if: inputs.variant == 'debug'
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Configure signing and key
+        env:
+          POCKET_API_KEY: ${{ secrets.POCKET_API_KEY }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          touch local.properties
+
+          if [ "${{ inputs.bake_api_key }}" = "true" ]; then
+            if [ -z "${POCKET_API_KEY}" ]; then
+              echo "::error::bake_api_key was requested but the POCKET_API_KEY secret is not set."
+              exit 1
+            fi
+            # Written to a file rather than echoed, so it cannot reach the log.
+            printf 'POCKET_API_KEY=%s\n' "${POCKET_API_KEY}" >> local.properties
+            echo "::warning::This APK contains your Pocket API key. Anyone who can download it can extract the key."
+          else
+            echo "Building without an API key — enter it on the watch under Settings → Pocket key."
+          fi
+
+          if [ "${{ inputs.variant }}" = "release" ]; then
+            if [ -z "${RELEASE_KEYSTORE_BASE64}" ]; then
+              echo "::error::A release APK must be signed or it cannot be installed."
+              echo "::error::Add RELEASE_KEYSTORE_BASE64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS and"
+              echo "::error::RELEASE_KEY_PASSWORD as repository secrets, or build the debug variant instead."
+              echo "::error::Create one with:"
+              echo "::error::  keytool -genkeypair -v -keystore release.jks -alias pocket -keyalg RSA -keysize 2048 -validity 10000"
+              echo "::error::  base64 -w0 release.jks"
+              exit 1
+            fi
+            echo "${RELEASE_KEYSTORE_BASE64}" | base64 -d > "${RUNNER_TEMP}/release.jks"
+            {
+              printf 'RELEASE_STORE_FILE=%s\n' "${RUNNER_TEMP}/release.jks"
+              printf 'RELEASE_STORE_PASSWORD=%s\n' "${RELEASE_STORE_PASSWORD}"
+              printf 'RELEASE_KEY_ALIAS=%s\n' "${RELEASE_KEY_ALIAS}"
+              printf 'RELEASE_KEY_PASSWORD=%s\n' "${RELEASE_KEY_PASSWORD}"
+            } >> local.properties
+          fi
+
+      - name: Build
+        run: |
+          if [ "${{ inputs.variant }}" = "release" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      - name: Collect the APK
+        id: apk
+        run: |
+          set -euo pipefail
+          src=$(find app/build/outputs/apk/${{ inputs.variant }} -name '*.apk' | head -n1)
+          if [ -z "${src}" ]; then
+            echo "::error::No APK was produced."
+            exit 1
+          fi
+
+          name="pocket-${{ inputs.variant }}-b${{ github.run_number }}-$(git rev-parse --short HEAD).apk"
+          mkdir -p dist
+          cp "${src}" "dist/${name}"
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "path=dist/${name}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "dist/${name}" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "dist/${name}" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload as an artifact
+        if: inputs.publish == 'artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      # A release asset is a direct .apk URL. An artifact is a zip, which is
+      # painful to deal with on a phone.
+      - name: Publish a release
+        if: inputs.publish == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="apk-b${{ github.run_number }}"
+
+          notes=$(cat <<EOF
+          Wear OS APK built from \`${{ github.ref_name }}\` at \`$(git rev-parse --short HEAD)\`.
+
+          | | |
+          |---|---|
+          | Variant | \`${{ inputs.variant }}\` |
+          | Size | ${{ steps.apk.outputs.size }} |
+          | API key baked in | \`${{ inputs.bake_api_key }}\` |
+          | SHA-256 | \`${{ steps.apk.outputs.sha256 }}\` |
+
+          This is a **watch** app and will not install on a phone — it requires
+          \`android.hardware.type.watch\`. Download it on your phone, then push it
+          to the watch with ADB over Wi-Fi or a sideloading app.
+
+          If no key is baked in, set one on the watch: **Settings → Pocket key → Enter key**.
+          EOF
+          )
+
+          gh release create "${tag}" "${{ steps.apk.outputs.path }}" \
+            --title "APK b${{ github.run_number }} (${{ inputs.variant }})" \
+            --notes "${notes}" \
+            --prerelease
+
+          echo "### APK ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "$(gh release view "${tag}" --json assets --jq '.assets[0].url')" >> "$GITHUB_STEP_SUMMARY"
