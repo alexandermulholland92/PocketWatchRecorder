@@ -4,9 +4,24 @@
 # For more details, see
 #   https://d.android.com/r/tools/r8/keep-rules
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# --- kotlinx.serialization -------------------------------------------------
+# The Retrofit bridge in PocketNetwork.kt looks serializers up reflectively
+# from a java.lang.reflect.Type, so the generated $$serializer classes and the
+# Companion.serializer() accessors have to survive shrinking. Without these the
+# release build fails at runtime with "Serializer for class ... not found",
+# which is exactly the kind of bug that only shows up after you ship.
+-keepattributes *Annotation*, InnerClasses, Signature, RuntimeVisibleAnnotations, AnnotationDefault
+
+-keepclassmembers class com.pocket.watchrecorder.** {
+    *** Companion;
+}
+-keepclasseswithmembers class com.pocket.watchrecorder.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keep,includedescriptorclasses class com.pocket.watchrecorder.**$$serializer { *; }
+
+# --- WorkManager -----------------------------------------------------------
+# Workers are instantiated by name from the WorkManager database.
+-keep class * extends androidx.work.ListenableWorker {
+    public <init>(android.content.Context, androidx.work.WorkerParameters);
+}

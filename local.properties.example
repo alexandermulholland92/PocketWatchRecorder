@@ -1,0 +1,15 @@
+# Copy to local.properties and fill in. local.properties is gitignored —
+# never commit a real key.
+
+# Android SDK location.
+sdk.dir=/path/to/Android/Sdk
+
+# Pocket public API key (https://heypocketai.com). Injected into
+# BuildConfig.POCKET_API_KEY at build time.
+POCKET_API_KEY=pk_your_key_here
+
+# Optional release signing. Leave unset to build an unsigned release.
+#RELEASE_STORE_FILE=/path/to/release.jks
+#RELEASE_STORE_PASSWORD=
+#RELEASE_KEY_ALIAS=
+#RELEASE_KEY_PASSWORD=
