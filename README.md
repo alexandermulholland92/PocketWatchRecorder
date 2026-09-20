@@ -15,9 +15,21 @@ your own API key.
 
 ### Or set the key on the watch
 
-A build-time key is optional. **Settings → Pocket key → Enter key** stores it
-encrypted on the device (AES-GCM under a hardware-backed Keystore key), and a
-key entered there takes precedence over anything baked in.
+A build-time key is optional. **Settings → Pocket key** stores it encrypted on
+the device (AES-GCM under a hardware-backed Keystore key), and a key entered
+there takes precedence over anything baked in. Two ways to get it in:
+
+- **Enter key** uses Wear's own input activity — watch keyboard, voice, or the
+  phone's keyboard where the watch offers it.
+- **Type from phone** serves a one-page form on the local network. The watch
+  shows a URL and a PIN; open the URL in your phone's browser, type, and it
+  lands on the watch. Both devices must be on the same Wi-Fi — over the
+  Bluetooth proxy the phone has no route to the watch, and the watch will say
+  so rather than show an address nothing can reach.
+
+  The listener runs only while that screen is open, on a random port, behind
+  the PIN, and stops the moment one valid submission arrives. The text does
+  cross the LAN as plaintext HTTP, protected only by your Wi-Fi encryption.
 
 Prefer this for any build you publish. A key baked in at build time ships in
 the APK as a plaintext constant, so the APK becomes a credential: you cannot

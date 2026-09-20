@@ -62,6 +62,7 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
     val library by viewModel.library.collectAsStateWithLifecycle()
     val route by viewModel.route.collectAsStateWithLifecycle()
     val keyState by viewModel.apiKeyState.collectAsStateWithLifecycle()
+    val bridgeState by viewModel.bridgeState.collectAsStateWithLifecycle()
 
     var hasMicPermission by remember { mutableStateOf(context.hasMicPermission()) }
     var permissionRequested by remember { mutableStateOf(false) }
@@ -117,9 +118,12 @@ fun PocketRecorderApp(viewModel: RecorderViewModel = viewModel()) {
 
                     currentRoute is Route.Settings -> SettingsScreen(
                         keyState = keyState,
+                        bridgeState = bridgeState,
                         listState = listState,
                         onEnterKey = enterApiKey,
                         onClearKey = viewModel::clearApiKey,
+                        onStartBridge = viewModel::startKeyboardBridge,
+                        onStopBridge = viewModel::stopKeyboardBridge,
                         onBack = viewModel::backToMain
                     )
 

@@ -10,6 +10,8 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.pocket.watchrecorder.audio.RecordingBus
 import com.pocket.watchrecorder.audio.RecordingService
+import com.pocket.watchrecorder.bridge.BridgeException
+import com.pocket.watchrecorder.bridge.KeyboardBridge
 import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
 import com.pocket.watchrecorder.network.PocketCredentials
@@ -65,6 +67,16 @@ sealed interface UiState {
     data class Done(val title: String?, val summary: String) : UiState
 
     data class Failed(val message: String, val canRetry: Boolean) : UiState
+}
+
+/** State of the phone-keyboard bridge, for the settings screen. */
+sealed interface BridgeState {
+    data object Off : BridgeState
+
+    /** Listening: point a phone browser at [url] and enter [pin]. */
+    data class Listening(val url: String, val pin: String) : BridgeState
+
+    data class Unavailable(val message: String) : BridgeState
 }
 
 /** Where the Pocket key is coming from, for the settings screen. */
@@ -159,6 +171,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     private val _apiKeyState = MutableStateFlow(readApiKeyState())
     val apiKeyState: StateFlow<ApiKeyState> = _apiKeyState.asStateFlow()
+
+    private val keyboardBridge = KeyboardBridge(application)
+
+    private val _bridgeState = MutableStateFlow<BridgeState>(BridgeState.Off)
+    val bridgeState: StateFlow<BridgeState> = _bridgeState.asStateFlow()
 
     /** One tracker per queue entry, keyed by entry id. */
     private val trackers = mutableMapOf<String, Job>()
@@ -301,6 +318,52 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun clearApiKey() {
         PocketCredentials.clear()
         _apiKeyState.value = readApiKeyState()
+    }
+
+    // -----------------------------------------------------------------------
+    // Typing from a phone
+    // -----------------------------------------------------------------------
+
+    /**
+     * Opens the phone-keyboard bridge and publishes where to point a browser.
+     *
+     * The bridge stops itself as soon as one valid submission arrives, and the
+     * screen stops it on the way out, so nothing is left listening.
+     */
+    fun startKeyboardBridge() {
+        viewModelScope.launch {
+            val result = keyboardBridge.start(viewModelScope) { typed ->
+                // Arrives on the bridge's IO thread.
+                viewModelScope.launch {
+                    saveApiKey(typed)
+                    _bridgeState.value = BridgeState.Off
+                }
+            }
+
+            _bridgeState.value = result.fold(
+                onSuccess = { BridgeState.Listening(it.url, it.pin) },
+                onFailure = { error ->
+                    BridgeState.Unavailable(
+                        when (val failure = (error as? BridgeException)?.failure) {
+                            is KeyboardBridge.Failure.NoWifi ->
+                                "Put the watch on Wi-Fi — the phone has no route over Bluetooth"
+
+                            is KeyboardBridge.Failure.Unavailable -> failure.reason
+                            null -> "Could not start"
+                        }
+                    )
+                }
+            )
+        }
+    }
+
+    fun stopKeyboardBridge() {
+        keyboardBridge.stop()
+        _bridgeState.value = BridgeState.Off
+    }
+
+    override fun onCleared() {
+        keyboardBridge.stop()
     }
 
     private fun readApiKeyState(): ApiKeyState = when {

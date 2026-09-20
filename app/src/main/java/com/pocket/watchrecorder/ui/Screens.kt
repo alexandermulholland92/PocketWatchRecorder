@@ -19,7 +19,9 @@ import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.CircularProgressIndicator
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
+import androidx.compose.runtime.DisposableEffect
 import com.pocket.watchrecorder.ApiKeyState
+import com.pocket.watchrecorder.BridgeState
 import com.pocket.watchrecorder.ItemStatus
 import com.pocket.watchrecorder.QueueItem
 import com.pocket.watchrecorder.UiState
@@ -388,11 +390,19 @@ internal fun FailedScreen(
 @Composable
 internal fun SettingsScreen(
     keyState: ApiKeyState,
+    bridgeState: BridgeState,
     listState: ScalingLazyListState,
     onEnterKey: () -> Unit,
     onClearKey: () -> Unit,
+    onStartBridge: () -> Unit,
+    onStopBridge: () -> Unit,
     onBack: () -> Unit
 ) {
+    // Never leave a socket listening once this screen is gone.
+    DisposableEffect(Unit) {
+        onDispose { onStopBridge() }
+    }
+
     ScalingLazyColumn(
         state = listState,
         modifier = Modifier
@@ -451,6 +461,80 @@ internal fun SettingsScreen(
                         .fillMaxWidth()
                         .padding(vertical = 2.dp)
                 )
+            }
+        }
+
+        // --- Type from a phone ---------------------------------------------
+        when (bridgeState) {
+            is BridgeState.Off -> item {
+                Chip(
+                    label = { Text("Type from phone") },
+                    onClick = onStartBridge,
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp)
+                )
+            }
+
+            is BridgeState.Listening -> {
+                item {
+                    Text(
+                        text = "Open on your phone",
+                        style = MaterialTheme.typography.caption1,
+                        color = MaterialTheme.colors.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 10.dp)
+                    )
+                }
+                item {
+                    Text(
+                        text = bridgeState.url,
+                        style = MaterialTheme.typography.title3,
+                        color = MaterialTheme.colors.secondary,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                item {
+                    Text(
+                        text = "PIN ${bridgeState.pin}",
+                        style = MaterialTheme.typography.title2,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 2.dp, bottom = 6.dp)
+                    )
+                }
+                item {
+                    Chip(
+                        label = { Text("Stop listening") },
+                        onClick = onStopBridge,
+                        colors = ChipDefaults.secondaryChipColors(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    )
+                }
+            }
+
+            is BridgeState.Unavailable -> {
+                item {
+                    Text(
+                        text = bridgeState.message,
+                        style = MaterialTheme.typography.caption2,
+                        color = MaterialTheme.colors.error,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                }
+                item {
+                    Chip(
+                        label = { Text("Try again") },
+                        onClick = onStartBridge,
+                        colors = ChipDefaults.secondaryChipColors(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    )
+                }
             }
         }
 
