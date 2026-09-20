@@ -291,23 +291,54 @@ internal fun recordedAtStamp(
     .format(UploadQueue.OFFSET_FORMAT)
 
 /**
- * A label reading in the recording's own local time, for the watch's library.
+ * A title reading in the recording's own local time.
  *
- * Not sent to Pocket. Supplying a title at provisioning suppresses Pocket's
- * own naming from the transcript, and it will not rename a recording
- * afterwards — PATCH on the recording endpoint answers 405 with "allow: GET"
- * — so a title sent up front is permanent. Leaving the field empty is the
- * deliberate choice: the generated title is worth more than a correct
- * timestamp in the title, and the recording's real time is shown correctly
- * elsewhere because recording_at carries a proper offset.
+ * Pocket names an untitled recording after its timestamp, rendered in UTC —
+ * so a correct instant still shows up as "Recording Sep 20, 2026 9:29 PM" for
+ * something recorded at 2:29 in the afternoon. Supplying the title ourselves
+ * is the only way to fix that: the public API has no endpoint for renaming a
+ * recording afterwards.
  *
  * Derived from [recordedAt] rather than the clock, so it stays right for an
- * entry that sat in the queue overnight. The offset carried in the timestamp
- * is the one the recording was made in, which is what should be displayed.
+ * entry that sat in the queue overnight, and so entries queued by an earlier
+ * build get a correct title too. The offset carried in the timestamp is the
+ * one the recording was made in, which is exactly what should be displayed.
+ *
+ * Returns null when the timestamp cannot be parsed, so a bad value means no
+ * title rather than a wrong one — Pocket falls back to its own.
  */
 internal fun localTitleFor(recordedAt: String): String? = runCatching {
     "Recording " + OffsetDateTime.parse(recordedAt.trim()).format(UploadQueue.TITLE_FORMAT)
 }.getOrNull()
+
+/**
+ * Length past which Pocket names a recording from its transcript.
+ *
+ * Inferred from real data rather than documentation, because the API has none
+ * on this. Every recording in this account under 70 seconds kept a generic
+ * title; every one over 155 seconds got a descriptive one, with nothing in
+ * between to contradict it. Two minutes sits comfortably inside that gap.
+ *
+ * One constant, deliberately: if a long recording ever turns up with a
+ * timestamp title, or a short one loses a good title, this is the only number
+ * to move.
+ */
+internal const val AI_TITLE_MIN_SECONDS = 120L
+
+/**
+ * The title to send at provisioning, or null to let Pocket name it.
+ *
+ * Both halves of what was wanted, applied where each actually matters. Pocket
+ * will not rename a recording afterwards — the endpoint answers 405 with
+ * "allow: GET" — and a supplied title suppresses its own naming, so the choice
+ * has to be made up front and cannot be revisited.
+ *
+ * Short recordings never earn a generated title, so supplying one costs
+ * nothing and fixes a default that would otherwise render in UTC. Long ones
+ * are where the generated title is worth having, so we stay out of the way.
+ */
+internal fun titleToSend(durationSeconds: Long, recordedAt: String): String? =
+    if (durationSeconds >= AI_TITLE_MIN_SECONDS) null else localTitleFor(recordedAt)
 
 /**
  * Brings a stored timestamp up to RFC3339.

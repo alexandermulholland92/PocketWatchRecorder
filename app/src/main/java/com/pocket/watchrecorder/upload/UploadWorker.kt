@@ -144,13 +144,11 @@ class UploadWorker(
                         // sent Pocket a truncated name like
                         // "4f89-11d3-...-watch_20260911.m4a".
                         fileName = current.fileName.removePrefix("${current.id}-"),
-                        // No title on purpose: supplying one suppresses
-                        // Pocket's naming from the transcript, permanently,
-                        // because it will not rename a recording afterwards.
-                        // Its own default renders the timestamp in UTC, which
-                        // is accepted — recording_at carries a real offset, so
-                        // the recording's actual time is right everywhere it
-                        // is shown from the data rather than from the title.
+                        // Only for recordings too short to earn a generated
+                        // title. Supplying one suppresses Pocket's own naming,
+                        // and it will not rename afterwards, so this is the
+                        // one chance to get it right either way.
+                        title = titleToSend(current.durationSeconds, recordedAt),
                         durationSeconds = current.durationSeconds,
                         // The same constant the PUT below uses, so the
                         // signature and the header cannot drift apart.
