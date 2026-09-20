@@ -53,18 +53,6 @@ class UploadWorker(
         private const val CHANNEL_ID = "uploads"
         private const val NOTIFICATION_ID = 1002
 
-        /**
-         * Above this size, refuse to start on a very slow link.
-         *
-         * On Wear, "connected" is often the Bluetooth proxy to the phone, which
-         * runs at a few KB/s. A minute of audio is roughly 480 KB, so a naive
-         * upload there stalls for many minutes and usually times out. There is
-         * no NetworkType that means "not Bluetooth", so we inspect the reported
-         * upstream bandwidth instead.
-         */
-        private const val LARGE_FILE_BYTES = 512L * 1024
-        private const val MIN_UPSTREAM_KBPS_FOR_LARGE = 400
-
         fun schedule(context: Context) {
             val request = OneTimeWorkRequestBuilder<UploadWorker>()
                 .setConstraints(
@@ -80,6 +68,29 @@ class UploadWorker(
             // if anything is still pending when it finishes.
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request)
+        }
+
+        /**
+         * Runs the queue now, cancelling any pending backoff.
+         *
+         * Only for an explicit "retry" from the user: after a failure the work
+         * sits in exponential backoff for up to four minutes, and KEEP would
+         * make their tap do nothing visible. REPLACE can interrupt an upload
+         * already in flight, but a stop mid-PUT costs that entry no attempts
+         * and the worker drains the whole queue again on the next pass.
+         */
+        fun scheduleNow(context: Context) {
+            val request = OneTimeWorkRequestBuilder<UploadWorker>()
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .build()
+
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
         }
     }
 
@@ -108,8 +119,11 @@ class UploadWorker(
                 continue
             }
 
-            if (!linkCanCarry(audio.length())) {
+            if (!linkCanCarry(entry, audio.length())) {
                 Log.i(TAG, "Deferring ${entry.id}: link too slow for ${audio.length()} bytes")
+                // Recorded, so the guard can't pass the same entry over
+                // forever and so the UI can distinguish this from a retry.
+                queue.update(entry.copy(deferrals = entry.deferrals + 1))
                 needsAnotherPass = true
                 continue
             }
@@ -120,7 +134,11 @@ class UploadWorker(
                 // --- Provision, but only if we don't already hold a live URL --
                 if (!current.hasUsableUrl) {
                     val provision = PocketClient.createUpload(
-                        fileName = current.fileName.substringAfter('-'),
+                        // removePrefix, not substringAfter('-'): the id is a
+                        // UUID and contains dashes of its own, so the old form
+                        // sent Pocket a truncated name like
+                        // "4f89-11d3-...-watch_20260911.m4a".
+                        fileName = current.fileName.removePrefix("${current.id}-"),
                         // No title: Pocket names it from the transcript.
                         durationSeconds = current.durationSeconds,
                         recordedAt = current.recordedAt
@@ -163,7 +181,7 @@ class UploadWorker(
                     }
                 }
 
-                queue.update(current.copy(uploaded = true, lastError = null))
+                queue.update(current.copy(uploaded = true, lastError = null, deferrals = 0))
                 UploadProgress.clear(current.id)
                 audio.delete()
                 Log.i(TAG, "Uploaded ${entry.id} -> ${current.recordingId}")
@@ -178,14 +196,26 @@ class UploadWorker(
                     return Result.retry()
                 }
 
-                val attempts = entry.attempts + 1
-                queue.update(entry.copy(attempts = attempts, lastError = t.shortMessage()))
+                // A permanent failure is spent immediately rather than
+                // burned down over five attempts and four minutes of backoff:
+                // the user just sees a stalled counter while nothing changes.
+                val permanent = t.isPermanent()
+                val attempts =
+                    if (permanent) UploadQueue.MAX_ATTEMPTS else entry.attempts + 1
+
+                queue.update(
+                    entry.copy(
+                        attempts = attempts,
+                        lastError = t.shortMessage(),
+                        deferrals = 0
+                    )
+                )
                 Log.e(TAG, "Upload failed for ${entry.id} (attempt $attempts)", t)
 
                 // Move on to the next entry rather than abandoning the run.
                 // Returning here meant one exhausted entry at the head of the
                 // queue blocked every later recording indefinitely.
-                if (attempts < UploadQueue.MAX_ATTEMPTS && !t.isPermanent()) {
+                if (attempts < UploadQueue.MAX_ATTEMPTS && !permanent) {
                     needsAnotherPass = true
                 }
             }
@@ -206,17 +236,20 @@ class UploadWorker(
      * precisely, so this is a guard against the obviously-hopeless case rather
      * than a real scheduler.
      */
-    private fun linkCanCarry(bytes: Long): Boolean {
-        if (bytes < LARGE_FILE_BYTES) return true
-
+    private fun linkCanCarry(entry: QueuedUpload, bytes: Long): Boolean {
         val manager = applicationContext.getSystemService(ConnectivityManager::class.java)
-            ?: return true
-        val capabilities = manager.activeNetwork
-            ?.let { manager.getNetworkCapabilities(it) }
-            ?: return false
+        val capabilities = manager?.activeNetwork?.let { manager.getNetworkCapabilities(it) }
 
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return true
-        return capabilities.linkUpstreamBandwidthKbps >= MIN_UPSTREAM_KBPS_FOR_LARGE
+        return shouldAttemptUpload(
+            attempts = entry.attempts,
+            deferrals = entry.deferrals,
+            bytes = bytes,
+            isWifi = capabilities
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true,
+            // No capabilities at all reads the same as no estimate: unknown,
+            // so attempt it rather than defer on a guess.
+            upstreamKbps = capabilities?.linkUpstreamBandwidthKbps ?: -1
+        )
     }
 
     /** A missing key or a 4xx will not fix itself; everything else might. */
@@ -261,6 +294,54 @@ class UploadWorker(
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
     }
+}
+
+/**
+ * Above this size, an upload is not worth starting on a very slow link.
+ *
+ * On Wear, "connected" is often the Bluetooth proxy to the phone, which runs at
+ * a few KB/s. A minute of audio is roughly 480 KB, so a naive upload there
+ * stalls for many minutes and usually times out. There is no NetworkType that
+ * means "not Bluetooth", so the reported upstream bandwidth is the only signal
+ * available.
+ */
+internal const val LARGE_FILE_BYTES = 512L * 1024
+
+internal const val MIN_UPSTREAM_KBPS_FOR_LARGE = 400
+
+/**
+ * Hard cap on how often the bandwidth guard may pass an entry over before it
+ * is attempted regardless.
+ */
+internal const val MAX_LINK_DEFERRALS = 3
+
+/**
+ * Whether to attempt [bytes] now, or hold out for a better link.
+ *
+ * File-scope and pure because the version of this that lived inside the worker
+ * could starve a recording indefinitely, and that is not something a comment
+ * can be trusted to prevent. Two of its answers were wrong:
+ *
+ *  - an unknown upstream estimate (0, which is what the Wear Bluetooth proxy
+ *    usually reports) counted as "too slow";
+ *  - an entry that had already been attempted could still be deferred.
+ *
+ * Either way the entry's attempt count stopped moving, so it never failed and
+ * never succeeded — the UI just showed a retry counter frozen at 1.
+ */
+internal fun shouldAttemptUpload(
+    attempts: Int,
+    deferrals: Int,
+    bytes: Long,
+    isWifi: Boolean,
+    upstreamKbps: Int
+): Boolean = when {
+    bytes < LARGE_FILE_BYTES -> true
+    attempts > 0 -> true                  // already committed to this one
+    deferrals >= MAX_LINK_DEFERRALS -> true
+    isWifi -> true
+    upstreamKbps <= 0 -> true              // no estimate is not evidence of a slow link
+    else -> upstreamKbps >= MIN_UPSTREAM_KBPS_FOR_LARGE
 }
 
 /**

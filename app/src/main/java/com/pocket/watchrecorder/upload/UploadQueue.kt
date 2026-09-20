@@ -54,6 +54,13 @@ data class QueuedUpload(
     val uploaded: Boolean = false,
     val attempts: Int = 0,
     val lastError: String? = null,
+    /**
+     * How many times the bandwidth guard has passed this entry over without
+     * attempting it. Persisted so the guard can't starve a recording forever,
+     * and so the UI can say "waiting for a faster link" rather than showing a
+     * retry counter that is not actually counting.
+     */
+    val deferrals: Int = 0,
     val queuedAtEpochMs: Long = 0L,
     /**
      * Written once the summary arrives, so a finished recording survives the
@@ -77,6 +84,13 @@ data class QueuedUpload(
     /** Still wants the worker to do something about it. */
     val needsUpload: Boolean
         get() = !uploaded && !isDeadLettered
+
+    /**
+     * Held back by the bandwidth guard rather than by a failure. Distinct from
+     * retrying: nothing is being attempted at all while this is true.
+     */
+    val awaitingFasterLink: Boolean
+        get() = deferrals > 0 && !uploaded && !isDeadLettered
 
     /**
      * Pre-signed URLs expire. Inside the window a retry can re-PUT to the same

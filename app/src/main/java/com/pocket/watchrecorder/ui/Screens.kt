@@ -93,7 +93,8 @@ internal fun WorkingScreen(
     state: UiState.Working,
     otherCount: Int,
     onOpenLibrary: () -> Unit,
-    onRecordAnother: () -> Unit
+    onRecordAnother: () -> Unit,
+    onRetry: () -> Unit
 ) {
     CenteredColumn {
         Box(contentAlignment = Alignment.Center) {
@@ -133,14 +134,29 @@ internal fun WorkingScreen(
             )
         }
 
+        // An upload that is failing or being held back used to leave the user
+        // with nothing to do but wait out five attempts, so give them the same
+        // escape hatch the failure screen has.
+        if (state.retryable) {
+            Chip(
+                label = { Text("Retry now") },
+                onClick = onRetry,
+                colors = ChipDefaults.primaryChipColors(),
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
+
         // Uploading happens in the background, so starting another take is fine.
         Chip(
             label = { Text("Record another") },
             onClick = onRecordAnother,
             colors = ChipDefaults.secondaryChipColors(),
-            modifier = Modifier.padding(top = 10.dp)
+            modifier = Modifier.padding(top = if (state.retryable) 4.dp else 10.dp)
         )
-        if (otherCount > 0) {
+
+        // Dropped while retryable, to keep this screen to two chips on a
+        // round display — it is the least useful of the three just then.
+        if (otherCount > 0 && !state.retryable) {
             Chip(
                 label = { Text("$otherCount more queued") },
                 onClick = onOpenLibrary,

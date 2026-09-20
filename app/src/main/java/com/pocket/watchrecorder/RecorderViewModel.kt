@@ -56,7 +56,9 @@ sealed interface UiState {
     data class Working(
         val phase: Phase,
         val progress: Float? = null,
-        val detail: String? = null
+        val detail: String? = null,
+        /** Something is wrong and the user can usefully push it along. */
+        val retryable: Boolean = false
     ) : UiState
 
     data class Done(val title: String?, val summary: String) : UiState
@@ -313,8 +315,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 dismissFocused()
                 return@launch
             }
-            queue.update(entry.copy(attempts = 0, lastError = null))
-            UploadWorker.schedule(getApplication())
+            queue.update(entry.copy(attempts = 0, lastError = null, deferrals = 0))
+            // scheduleNow, not schedule: after a failure the work is sitting in
+            // backoff for up to four minutes, and the default KEEP policy would
+            // make the user's tap do nothing they can see.
+            UploadWorker.scheduleNow(getApplication())
             ensureTracked(id)
         }
     }
@@ -418,16 +423,27 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun publishUploading(entryId: String, entry: QueuedUpload) {
+        val error = entry.lastError
         publish(
             entryId,
             UiState.Working(
                 phase = Phase.UPLOADING,
                 progress = UploadProgress.fractionFor(entryId) ?: workProgress,
+                // "retrying · 1" used to be shown for anything with a recorded
+                // error, including an entry the bandwidth guard was passing
+                // over on every run — so the counter sat at 1 forever while
+                // nothing was actually being retried, and the reason was
+                // nowhere on screen.
                 detail = when {
-                    entry.lastError != null -> "retrying · ${entry.attempts}"
+                    entry.awaitingFasterLink -> "waiting for a faster link"
+                    error != null ->
+                        "retry ${entry.attempts}/${UploadQueue.MAX_ATTEMPTS} · " +
+                                error.take(24)
+
                     workState == WorkInfo.State.ENQUEUED -> "waiting for network"
                     else -> null
-                }
+                },
+                retryable = error != null || entry.awaitingFasterLink
             )
         )
     }

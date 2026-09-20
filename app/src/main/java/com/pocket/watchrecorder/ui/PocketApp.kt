@@ -162,7 +162,8 @@ private fun MainRoute(
             state = state,
             otherCount = (otherCount - 1).coerceAtLeast(0),
             onOpenLibrary = viewModel::openLibrary,
-            onRecordAnother = viewModel::onPrimaryAction
+            onRecordAnother = viewModel::onPrimaryAction,
+            onRetry = viewModel::retryFocused
         )
 
         is UiState.Done -> SummaryScreen(
