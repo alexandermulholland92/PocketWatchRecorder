@@ -16,7 +16,9 @@ import java.time.Duration
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.OffsetDateTime
 import java.time.temporal.ChronoUnit
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -123,6 +125,10 @@ class UploadQueue(private val context: Context) {
         internal val OFFSET_FORMAT: DateTimeFormatter =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX")
 
+        /** Mirrors how Pocket names an untitled recording, minus the UTC. */
+        internal val TITLE_FORMAT: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("MMM d, yyyy h:mm a", Locale.US)
+
         /** RFC3339 requires a zone: either "Z" or a numeric offset. */
         internal val RFC3339_ZONE = Regex("(Z|[+-]\\d{2}:\\d{2})$")
 
@@ -178,12 +184,15 @@ class UploadQueue(private val context: Context) {
                 audio.delete()
             }
 
+            val recordedAt = recordedAtStamp(durationMs)
             val entry = QueuedUpload(
                 id = id,
                 fileName = target.name,
-                title = title,
+                // The same title the watch shows in its own library, so the
+                // two agree before Pocket has said anything.
+                title = localTitleFor(recordedAt) ?: title,
                 durationSeconds = (durationMs / 1000).coerceAtLeast(1L),
-                recordedAt = recordedAtStamp(durationMs),
+                recordedAt = recordedAt,
                 queuedAtEpochMs = System.currentTimeMillis()
             )
             writeBlocking(entry)
@@ -280,6 +289,27 @@ internal fun recordedAtStamp(
     .truncatedTo(ChronoUnit.SECONDS)
     .atZone(zone)
     .format(UploadQueue.OFFSET_FORMAT)
+
+/**
+ * A title reading in the recording's own local time.
+ *
+ * Pocket names an untitled recording after its timestamp, rendered in UTC —
+ * so a correct instant still shows up as "Recording Sep 20, 2026 9:29 PM" for
+ * something recorded at 2:29 in the afternoon. Supplying the title ourselves
+ * is the only way to fix that: the public API has no endpoint for renaming a
+ * recording afterwards.
+ *
+ * Derived from [recordedAt] rather than the clock, so it stays right for an
+ * entry that sat in the queue overnight, and so entries queued by an earlier
+ * build get a correct title too. The offset carried in the timestamp is the
+ * one the recording was made in, which is exactly what should be displayed.
+ *
+ * Returns null when the timestamp cannot be parsed, so a bad value means no
+ * title rather than a wrong one — Pocket falls back to its own.
+ */
+internal fun localTitleFor(recordedAt: String): String? = runCatching {
+    "Recording " + OffsetDateTime.parse(recordedAt.trim()).format(UploadQueue.TITLE_FORMAT)
+}.getOrNull()
 
 /**
  * Brings a stored timestamp up to RFC3339.

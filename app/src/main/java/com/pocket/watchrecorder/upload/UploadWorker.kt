@@ -134,18 +134,26 @@ class UploadWorker(
 
                 // --- Provision, but only if we don't already hold a live URL --
                 if (!current.hasUsableUrl) {
+                    // Normalised once and used for both fields, so the title
+                    // and the timestamp can never disagree.
+                    val recordedAt = normalizeRecordedAt(current.recordedAt)
                     val provision = PocketClient.createUpload(
                         // removePrefix, not substringAfter('-'): the id is a
                         // UUID and contains dashes of its own, so the old form
                         // sent Pocket a truncated name like
                         // "4f89-11d3-...-watch_20260911.m4a".
                         fileName = current.fileName.removePrefix("${current.id}-"),
-                        // No title: Pocket names it from the transcript.
+                        // Supplied so it reads in the recording's own local
+                        // time. Pocket's own default renders the timestamp in
+                        // UTC, and there is no endpoint to rename afterwards.
+                        // Long recordings should still pick up an AI title
+                        // once summarization runs.
+                        title = localTitleFor(recordedAt),
                         durationSeconds = current.durationSeconds,
                         // Normalised at send time, not at enqueue: a recording
                         // queued by an earlier build holds a zone-less
                         // timestamp the API rejects outright.
-                        recordedAt = normalizeRecordedAt(current.recordedAt)
+                        recordedAt = recordedAt
                     )
                     val lifetime = provision.expiresInSeconds?.times(1_000L)
                         ?: UploadQueue.DEFAULT_URL_LIFETIME_MS
