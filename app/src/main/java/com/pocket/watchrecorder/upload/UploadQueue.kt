@@ -29,18 +29,6 @@ import java.util.UUID
  * recording behind. Writing [recordingId] down before the PUT starts is what
  * makes a retry resume rather than duplicate.
  */
-/** How `recording_at` is rendered on the wire. See [UploadQueue.recordedAtStamp]. */
-internal enum class RecordedAtFormat {
-    /** "2026-09-11T15:28:00" — no zone marker. */
-    LOCAL_NAIVE,
-
-    /** "2026-09-11T15:28:00Z" — wall clock mislabelled as UTC. */
-    LOCAL_AS_UTC,
-
-    /** "2026-09-11T15:28:00-07:00" — genuinely correct instant. */
-    OFFSET
-}
-
 @Serializable
 data class QueuedUpload(
     val id: String,
@@ -132,13 +120,11 @@ class UploadQueue(private val context: Context) {
         /** Fallback lifetime when the API doesn't report expires_in. */
         const val DEFAULT_URL_LIFETIME_MS = 45 * 60 * 1_000L
 
-        /** See [recordedAtStamp]. */
-        internal val RECORDED_AT_FORMAT = RecordedAtFormat.LOCAL_NAIVE
-
-        internal val LOCAL_NAIVE_FORMAT: DateTimeFormatter =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
         internal val OFFSET_FORMAT: DateTimeFormatter =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX")
+
+        /** RFC3339 requires a zone: either "Z" or a numeric offset. */
+        internal val RFC3339_ZONE = Regex("(Z|[+-]\\d{2}:\\d{2})$")
 
         /**
          * Bumped by every writer, process-wide.
@@ -268,38 +254,52 @@ class UploadQueue(private val context: Context) {
 }
 
 /**
- * Start time of a recording that just ended.
+ * Start time of a recording that just ended, as RFC3339.
  *
- * Pocket displays `recording_at` without converting to local time, but it does
- * store whatever instant the string resolves to. That makes the two obvious
- * formats mutually exclusive:
+ * This used to be a compile-time toggle between three guesses at what Pocket
+ * wanted. The server settled it:
  *
- *  - OFFSET       "…15:28:00-07:00" — instant correct, title reads 7h late
- *  - LOCAL_AS_UTC "…15:28:00Z"      — title correct, instant 7h early
+ *     HTTP 400: invalid recording_at: must be RFC3339 format
+ *               (e.g., 2006-01-02T15:04:05Z07:00)
  *
- * LOCAL_NAIVE sends no zone marker at all, on the theory that Pocket takes an
- * unqualified datetime at face value rather than shifting it. If that holds,
- * both the title and the stored value are right.
+ * which rules out the wall-clock-with-no-zone form that was being sent. Of the
+ * two that remain, a real offset is the only one that is also *true*: labelling
+ * local time as UTC parses fine and stores an instant hours away from when the
+ * recording happened. That mistake is visible in this account's own history,
+ * where some entries carry a recording_at seven hours off their created_at.
  *
- * File-scope and `internal` so the format can be pinned down by a test rather
- * than by editing a constant and reinstalling.
+ * An explicit formatter rather than toString(): the latter drops ":00" seconds,
+ * and a strict parser is exactly what we are dealing with.
  */
 internal fun recordedAtStamp(
     durationMs: Long,
-    format: RecordedAtFormat = UploadQueue.RECORDED_AT_FORMAT,
     zone: ZoneId = ZoneId.systemDefault(),
     now: LocalDateTime = LocalDateTime.now(zone)
-): String {
-    val startedAt = now
-        .minus(Duration.ofMillis(durationMs))
-        .truncatedTo(ChronoUnit.SECONDS)
+): String = now
+    .minus(Duration.ofMillis(durationMs))
+    .truncatedTo(ChronoUnit.SECONDS)
+    .atZone(zone)
+    .format(UploadQueue.OFFSET_FORMAT)
 
-    return when (format) {
-        // Explicit formatters: LocalDateTime.toString() drops ":00" seconds,
-        // which a strict server-side parser may reject.
-        RecordedAtFormat.LOCAL_NAIVE -> startedAt.format(UploadQueue.LOCAL_NAIVE_FORMAT)
-        RecordedAtFormat.LOCAL_AS_UTC -> startedAt.format(UploadQueue.LOCAL_NAIVE_FORMAT) + "Z"
-        RecordedAtFormat.OFFSET ->
-            startedAt.atZone(zone).format(UploadQueue.OFFSET_FORMAT)
-    }
+/**
+ * Brings a stored timestamp up to RFC3339.
+ *
+ * Recordings queued by an earlier build hold a zone-less string and would be
+ * rejected forever, which is the worst kind of bug: audio captured, saved, and
+ * permanently unsendable. Those were written as local wall clock, so attaching
+ * the device's offset recovers the instant they meant.
+ *
+ * Anything already carrying a zone is left exactly as it is.
+ */
+internal fun normalizeRecordedAt(
+    stored: String,
+    zone: ZoneId = ZoneId.systemDefault()
+): String {
+    val trimmed = stored.trim()
+    if (trimmed.isEmpty()) return trimmed
+    if (UploadQueue.RFC3339_ZONE.containsMatchIn(trimmed)) return trimmed
+
+    return runCatching {
+        LocalDateTime.parse(trimmed).atZone(zone).format(UploadQueue.OFFSET_FORMAT)
+    }.getOrDefault(trimmed)
 }

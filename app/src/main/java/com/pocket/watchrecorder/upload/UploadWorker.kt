@@ -142,7 +142,10 @@ class UploadWorker(
                         fileName = current.fileName.removePrefix("${current.id}-"),
                         // No title: Pocket names it from the transcript.
                         durationSeconds = current.durationSeconds,
-                        recordedAt = current.recordedAt
+                        // Normalised at send time, not at enqueue: a recording
+                        // queued by an earlier build holds a zone-less
+                        // timestamp the API rejects outright.
+                        recordedAt = normalizeRecordedAt(current.recordedAt)
                     )
                     val lifetime = provision.expiresInSeconds?.times(1_000L)
                         ?: UploadQueue.DEFAULT_URL_LIFETIME_MS

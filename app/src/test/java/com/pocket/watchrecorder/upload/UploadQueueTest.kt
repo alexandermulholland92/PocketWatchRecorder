@@ -14,50 +14,79 @@ class RecordedAtStampTest {
     /** 2026-09-11 15:30:00 local, i.e. during PDT (UTC-07:00). */
     private val now: LocalDateTime = LocalDateTime.of(2026, 9, 11, 15, 30, 0)
 
+    /** What the API demands, and rejected us for not sending. */
+    private val rfc3339 = Regex("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(Z|[+-]\\d{2}:\\d{2})$")
+
+    @Test
+    fun `the stamp is RFC3339 with a real offset`() {
+        // The server's words: "invalid recording_at: must be RFC3339 format".
+        // A zone-less wall clock was rejected outright.
+        val stamp = recordedAtStamp(0, zone, now)
+        assertEquals("2026-09-11T15:30:00-07:00", stamp)
+        assertTrue("not RFC3339: $stamp", rfc3339.matches(stamp))
+    }
+
+    @Test
+    fun `a UTC device still produces a valid zone marker`() {
+        val stamp = recordedAtStamp(0, ZoneId.of("UTC"), now)
+        assertEquals("2026-09-11T15:30:00Z", stamp)
+        assertTrue("not RFC3339: $stamp", rfc3339.matches(stamp))
+    }
+
     @Test
     fun `the stamp is the start of the recording, not its end`() {
         assertEquals(
-            "2026-09-11T15:28:00",
-            recordedAtStamp(
-                durationMs = 120_000,
-                format = RecordedAtFormat.LOCAL_NAIVE,
-                zone = zone,
-                now = now
-            )
+            "2026-09-11T15:28:00-07:00",
+            recordedAtStamp(durationMs = 120_000, zone = zone, now = now)
         )
     }
 
     @Test
     fun `seconds are always written, even when they are zero`() {
-        // LocalDateTime.toString() would render this as "2026-09-11T15:30",
-        // which a strict server-side parser can reject.
-        val stamp = recordedAtStamp(0, RecordedAtFormat.LOCAL_NAIVE, zone, now)
-        assertTrue("expected seconds in $stamp", stamp.endsWith(":00"))
-        assertEquals(19, stamp.length)
-    }
-
-    @Test
-    fun `each format renders the marker it promises`() {
-        assertEquals(
-            "2026-09-11T15:30:00",
-            recordedAtStamp(0, RecordedAtFormat.LOCAL_NAIVE, zone, now)
-        )
-        assertEquals(
-            "2026-09-11T15:30:00Z",
-            recordedAtStamp(0, RecordedAtFormat.LOCAL_AS_UTC, zone, now)
-        )
-        assertEquals(
-            "2026-09-11T15:30:00-07:00",
-            recordedAtStamp(0, RecordedAtFormat.OFFSET, zone, now)
-        )
+        // LocalDateTime.toString() would drop them, and this parser is strict.
+        assertTrue(recordedAtStamp(0, zone, now).contains(":30:00"))
     }
 
     @Test
     fun `sub-second recordings do not roll back a whole second`() {
         assertEquals(
-            "2026-09-11T15:29:59",
-            recordedAtStamp(500, RecordedAtFormat.LOCAL_NAIVE, zone, now)
+            "2026-09-11T15:29:59-07:00",
+            recordedAtStamp(500, zone, now)
         )
+    }
+}
+
+class NormalizeRecordedAtTest {
+
+    private val zone: ZoneId = ZoneId.of("America/Los_Angeles")
+
+    @Test
+    fun `a timestamp queued by an older build gains the device offset`() {
+        // Written as local wall clock, so the offset recovers the real instant
+        // rather than inventing one.
+        assertEquals(
+            "2026-09-11T15:28:00-07:00",
+            normalizeRecordedAt("2026-09-11T15:28:00", zone)
+        )
+    }
+
+    @Test
+    fun `a timestamp that already has a zone is left alone`() {
+        assertEquals(
+            "2026-09-11T15:28:00-07:00",
+            normalizeRecordedAt("2026-09-11T15:28:00-07:00", zone)
+        )
+        assertEquals(
+            "2026-09-11T22:28:00Z",
+            normalizeRecordedAt("2026-09-11T22:28:00Z", zone)
+        )
+    }
+
+    @Test
+    fun `unparseable text is passed through rather than replaced with a wrong instant`() {
+        // Better the server rejects it than we silently claim it happened now.
+        assertEquals("not a date", normalizeRecordedAt("not a date", zone))
+        assertEquals("", normalizeRecordedAt("   ", zone))
     }
 }
 
