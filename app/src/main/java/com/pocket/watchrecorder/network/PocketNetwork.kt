@@ -154,7 +154,18 @@ data class UploadUrlRequest(
     /** Length in seconds. Documented field; omitting it may leave work unqueued. */
     val duration: Long? = null,
     /** ISO-8601 instant the audio was captured. */
-    @SerialName("recording_at") val recordingAt: String? = null
+    @SerialName("recording_at") val recordingAt: String? = null,
+    /**
+     * The media type the audio will be PUT with.
+     *
+     * Sent so the two ends cannot disagree. A pre-signed URL can bind the
+     * content type into its signature, in which case a PUT carrying a
+     * different one fails as 403 SignatureDoesNotMatch — an error that says
+     * nothing about its own cause. This field was previously not sent at all
+     * while the PUT set a header regardless, so the agreement the upload
+     * depends on was left to chance.
+     */
+    @SerialName("content_type") val contentType: String? = null
 )
 
 /**
@@ -244,6 +255,23 @@ internal fun HttpException.pocketErrorMessage(): String? {
         .takeIf { it.isNotBlank() }
         ?.take(70)
 }
+
+/**
+ * A rejected PUT to the pre-signed URL.
+ *
+ * S3 answers in XML, and the useful part is the Code element —
+ * SignatureDoesNotMatch, RequestTimeTooSkewed, EntityTooLarge and so on. The
+ * raw body is a wall of XML that truncates to nothing readable on a watch, so
+ * the code is pulled out and the rest discarded.
+ */
+class S3UploadException(val code: Int, val errorCode: String?) : IOException(
+    if (errorCode != null) "S3 $code: $errorCode" else "S3 upload failed (HTTP $code)"
+)
+
+/** Pulls the error code out of an S3 XML error body. */
+internal fun s3ErrorCode(body: String): String? =
+    Regex("<Code>([^<]{1,60})</Code>").find(body)?.groupValues?.get(1)?.trim()
+        ?.takeIf { it.isNotBlank() }
 
 /**
  * Thrown when no usable API key was baked into the build.
@@ -384,7 +412,8 @@ object PocketClient {
         fileName: String,
         title: String? = null,
         durationSeconds: Long? = null,
-        recordedAt: String? = null
+        recordedAt: String? = null,
+        contentType: String? = null
     ): ProvisionedUpload {
         if (!isApiKeyConfigured) throw MissingApiKeyException()
 
@@ -393,7 +422,8 @@ object PocketClient {
                 fileName = fileName,
                 title = title,
                 duration = durationSeconds,
-                recordingAt = recordedAt
+                recordingAt = recordedAt,
+                contentType = contentType
             )
         ).toProvisionedUpload()
     }
@@ -406,8 +436,10 @@ object PocketClient {
      * Streams [file] to the pre-signed [uploadUrl] with a raw OkHttp PUT.
      *
      * [contentType] must be byte-identical to the content_type sent during
-     * provisioning — it is part of the signature, and a mismatch surfaces as a
-     * 403 SignatureDoesNotMatch rather than anything more descriptive.
+     * provisioning — it can be part of the signature, and a mismatch surfaces
+     * as a 403 SignatureDoesNotMatch rather than anything more descriptive.
+     * Both now come from one constant, which is what makes that claim true;
+     * it predated the field actually being sent.
      *
      * Cancelling the calling coroutine cancels the in-flight HTTP call.
      */
@@ -440,11 +472,10 @@ object PocketClient {
                         onProgress(1f)
                         continuation.resume(Unit)
                     } else {
-                        val detail = runCatching { res.body?.string().orEmpty() }
+                        val body = runCatching { res.body?.string().orEmpty() }
                             .getOrDefault("")
-                            .take(240)
                         continuation.resumeWithException(
-                            IOException("S3 upload failed (HTTP ${res.code}) $detail".trim())
+                            S3UploadException(res.code, s3ErrorCode(body))
                         )
                     }
                 }

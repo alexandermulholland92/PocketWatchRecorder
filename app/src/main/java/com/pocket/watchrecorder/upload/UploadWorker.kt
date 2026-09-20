@@ -23,6 +23,7 @@ import com.pocket.watchrecorder.R
 import com.pocket.watchrecorder.audio.AudioRecorderManager
 import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
+import com.pocket.watchrecorder.network.S3UploadException
 import com.pocket.watchrecorder.network.pocketErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -150,6 +151,9 @@ class UploadWorker(
                         // once summarization runs.
                         title = localTitleFor(recordedAt),
                         durationSeconds = current.durationSeconds,
+                        // The same constant the PUT below uses, so the
+                        // signature and the header cannot drift apart.
+                        contentType = AudioRecorderManager.CONTENT_TYPE,
                         // Normalised at send time, not at enqueue: a recording
                         // queued by an earlier build holds a zone-less
                         // timestamp the API rejects outright.
@@ -278,6 +282,9 @@ class UploadWorker(
         is HttpException -> pocketErrorMessage()
             ?.let { "HTTP ${code()}: $it" }
             ?: "HTTP ${code()}"
+        // Already a short, readable sentence. Wrapping it in a class name
+        // only pushes the useful part off the edge of a watch screen.
+        is S3UploadException -> message ?: "Upload rejected"
         else -> this::class.java.simpleName + (message?.let { ": ${it.take(50)}" } ?: "")
     }
 
