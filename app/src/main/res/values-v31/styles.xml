@@ -1,0 +1,17 @@
+<resources>
+
+    <!--
+      From API 31 the system draws the splash itself, and it reads the
+      framework attributes rather than the androidx compat ones. Without this
+      file the icon is whatever the platform decides — normally the launcher
+      icon — and the theme above is quietly ignored on every modern watch.
+
+      postSplashScreenTheme stays unprefixed: that one belongs to androidx and
+      has no framework equivalent.
+    -->
+    <style name="MainActivityTheme.Starting" parent="Theme.SplashScreen">
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@android:style/Theme.DeviceDefault</item>
+    </style>
+</resources>

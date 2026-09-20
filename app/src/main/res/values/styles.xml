@@ -1,8 +1,17 @@
 <resources>
 
+    <!--
+      The splash icon is the app's own launcher art. It used to point at
+      @drawable/splash_icon, which was the Wear project template's placeholder
+      — a white circle containing the Android robot — and that is what showed
+      on screen once the splash was actually installed.
+
+      The foreground already carries its own white plate, so it reads clearly
+      against the black splash background without needing an icon background.
+    -->
     <style name="MainActivityTheme.Starting" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@android:color/black</item>
-        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_icon</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
         <item name="postSplashScreenTheme">@android:style/Theme.DeviceDefault</item>
     </style>
 </resources>
