@@ -138,10 +138,12 @@ jobs:
           mkdir -p dist
           cp "${src}" "dist/${name}"
 
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          echo "path=dist/${name}" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(sha256sum "dist/${name}" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "size=$(du -h "dist/${name}" | cut -f1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=${name}"
+            echo "path=dist/${name}"
+            echo "sha256=$(sha256sum "dist/${name}" | cut -d' ' -f1)"
+            echo "size=$(du -h "dist/${name}" | cut -f1)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload as an artifact
         if: env.PUBLISH == 'artifact'
@@ -184,6 +186,8 @@ jobs:
             --notes "${notes}" \
             --prerelease
 
-          echo "### APK ready" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "$(gh release view "${tag}" --json assets --jq '.assets[0].url')" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### APK ready"
+            echo ""
+            gh release view "${tag}" --json assets --jq '.assets[0].url'
+          } >> "$GITHUB_STEP_SUMMARY"
