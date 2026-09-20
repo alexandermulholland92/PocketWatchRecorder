@@ -34,6 +34,14 @@ put it in a GitHub release, hand it to anyone, or rotate without rebuilding.
 **Actions → APK → Run workflow** builds one and attaches it to a prerelease, so
 you get a direct `.apk` link you can open on your phone.
 
+That button only appears once this workflow is on the default branch — GitHub
+does not offer `workflow_dispatch` for a workflow it can only see on a feature
+branch. Until then, or any time you prefer it, push a tag:
+
+```bash
+git tag apk-v1 && git push origin apk-v1
+```
+
 | Input | Use |
 |---|---|
 | `variant` | `debug` needs no setup and installs straight away. `release` is smaller and R8-shrunk, but needs signing secrets (the workflow tells you which). |

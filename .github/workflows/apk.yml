@@ -1,6 +1,18 @@
 name: APK
 
-# Run this by hand: Actions → APK → Run workflow.
+# Two ways in:
+#
+#   Actions → APK → Run workflow, once this file is on the default branch.
+#   GitHub only offers that button for workflows it can see on the default
+#   branch, so it does nothing for a workflow that lives only on a feature
+#   branch.
+#
+#   Or push a tag matching apk-v*, which works from any branch and is the only
+#   option until this is merged:
+#
+#     git tag apk-v1 && git push origin apk-v1
+#
+# A tag build uses the defaults below.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +30,8 @@ on:
         description: 'Bake the POCKET_API_KEY secret into the APK. Leave off and enter the key on the watch instead.'
         type: boolean
         default: false
+  push:
+    tags: ['apk-v*']
 
 permissions:
   contents: write
@@ -25,6 +39,12 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
+    # Resolved once here so the tag-push path gets defaults, and so no input
+    # is interpolated straight into a shell script.
+    env:
+      VARIANT: ${{ inputs.variant || 'debug' }}
+      PUBLISH: ${{ inputs.publish || 'release' }}
+      BAKE_KEY: ${{ inputs.bake_api_key || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +68,7 @@ jobs:
       # different identity, and the watch refuses to install over the last one
       # ("app not installed") until you uninstall first.
       - name: Cache the debug signing key
-        if: inputs.variant == 'debug'
+        if: env.VARIANT == 'debug'
         uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
@@ -65,7 +85,7 @@ jobs:
           set -euo pipefail
           touch local.properties
 
-          if [ "${{ inputs.bake_api_key }}" = "true" ]; then
+          if [ "${BAKE_KEY}" = "true" ]; then
             if [ -z "${POCKET_API_KEY}" ]; then
               echo "::error::bake_api_key was requested but the POCKET_API_KEY secret is not set."
               exit 1
@@ -77,7 +97,7 @@ jobs:
             echo "Building without an API key — enter it on the watch under Settings → Pocket key."
           fi
 
-          if [ "${{ inputs.variant }}" = "release" ]; then
+          if [ "${VARIANT}" = "release" ]; then
             if [ -z "${RELEASE_KEYSTORE_BASE64}" ]; then
               echo "::error::A release APK must be signed or it cannot be installed."
               echo "::error::Add RELEASE_KEYSTORE_BASE64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS and"
@@ -98,7 +118,7 @@ jobs:
 
       - name: Build
         run: |
-          if [ "${{ inputs.variant }}" = "release" ]; then
+          if [ "${VARIANT}" = "release" ]; then
             ./gradlew assembleRelease
           else
             ./gradlew assembleDebug
@@ -108,13 +128,13 @@ jobs:
         id: apk
         run: |
           set -euo pipefail
-          src=$(find app/build/outputs/apk/${{ inputs.variant }} -name '*.apk' | head -n1)
+          src=$(find "app/build/outputs/apk/${VARIANT}" -name '*.apk' | head -n1)
           if [ -z "${src}" ]; then
             echo "::error::No APK was produced."
             exit 1
           fi
 
-          name="pocket-${{ inputs.variant }}-b${{ github.run_number }}-$(git rev-parse --short HEAD).apk"
+          name="pocket-${VARIANT}-b${{ github.run_number }}-$(git rev-parse --short HEAD).apk"
           mkdir -p dist
           cp "${src}" "dist/${name}"
 
@@ -124,7 +144,7 @@ jobs:
           echo "size=$(du -h "dist/${name}" | cut -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Upload as an artifact
-        if: inputs.publish == 'artifact'
+        if: env.PUBLISH == 'artifact'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.apk.outputs.name }}
@@ -134,7 +154,7 @@ jobs:
       # A release asset is a direct .apk URL. An artifact is a zip, which is
       # painful to deal with on a phone.
       - name: Publish a release
-        if: inputs.publish == 'release'
+        if: env.PUBLISH == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -146,9 +166,9 @@ jobs:
 
           | | |
           |---|---|
-          | Variant | \`${{ inputs.variant }}\` |
+          | Variant | \`${VARIANT}\` |
           | Size | ${{ steps.apk.outputs.size }} |
-          | API key baked in | \`${{ inputs.bake_api_key }}\` |
+          | API key baked in | \`${BAKE_KEY}\` |
           | SHA-256 | \`${{ steps.apk.outputs.sha256 }}\` |
 
           This is a **watch** app and will not install on a phone — it requires
@@ -160,7 +180,7 @@ jobs:
           )
 
           gh release create "${tag}" "${{ steps.apk.outputs.path }}" \
-            --title "APK b${{ github.run_number }} (${{ inputs.variant }})" \
+            --title "APK b${{ github.run_number }} (${VARIANT})" \
             --notes "${notes}" \
             --prerelease
 
