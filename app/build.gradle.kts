@@ -15,8 +15,44 @@ val localProperties = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
+/**
+ * A build-time setting, from local.properties or the environment.
+ *
+ * The environment is checked too so a key can be supplied without editing a
+ * file at all — useful on machines where the local.properties route has been
+ * unreliable, and the reason the old in-source fallback constant existed.
+ */
 fun localProperty(name: String): String? =
     localProperties.getProperty(name)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(name)?.takeIf { it.isNotBlank() }
+
+/** Mirrors isUsableApiKey() in PocketNetwork.kt. */
+fun looksLikePlaceholder(value: String): Boolean =
+    listOf("paste", "your_api_key", "your-api-key", "your key", "your_key", "yourkey", "xxx")
+        .any { value.trim().lowercase().contains(it) }
+
+val pocketApiKey: String = localProperty("POCKET_API_KEY").orEmpty()
+
+// Say so at build time. Baking in an empty key and letting it surface as a
+// failed upload on the watch is a miserable way to find out, and it is exactly
+// what happened when local.properties stopped being a tracked file.
+if (pocketApiKey.isBlank()) {
+    logger.warn(
+        "\n**********************************************************************\n" +
+        "POCKET_API_KEY is not set. The app will build, but every upload will\n" +
+        "fail with \"No API key in this build\".\n" +
+        "Set it in local.properties (see local.properties.example) or export\n" +
+        "POCKET_API_KEY in your environment.\n" +
+        "**********************************************************************"
+    )
+} else if (looksLikePlaceholder(pocketApiKey)) {
+    logger.warn(
+        "\n**********************************************************************\n" +
+        "POCKET_API_KEY still looks like a placeholder (\"" + pocketApiKey.take(12) + "...\").\n" +
+        "Uploads will be rejected. Put your real Pocket key in local.properties.\n" +
+        "**********************************************************************"
+    )
+}
 
 android {
     namespace = "com.pocket.watchrecorder"
@@ -32,7 +68,7 @@ android {
         // The base URL used to be injected here too, but PocketNetwork.kt has
         // always hardcoded it — the field only added a way for it to arrive
         // empty, so it is gone.
-        buildConfigField("String", "POCKET_API_KEY", "\"${localProperty("POCKET_API_KEY") ?: ""}\"")
+        buildConfigField("String", "POCKET_API_KEY", "\"$pocketApiKey\"")
     }
 
     signingConfigs {

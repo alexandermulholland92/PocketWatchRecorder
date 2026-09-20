@@ -11,7 +11,15 @@ your own API key.
 3. `./gradlew installDebug` with a watch (or Wear emulator) attached.
 
 `local.properties` is gitignored and must stay that way — it holds your key.
-There is no in-source fallback constant to paste a key into, deliberately.
+You can also `export POCKET_API_KEY=...` instead of putting it in the file.
+
+> **Upgrading from before this branch: your key is gone.** `local.properties`
+> used to be tracked, and `PocketNetwork.kt` used to carry an `API_KEY_FALLBACK`
+> constant you could paste a key into. Both are removed, so pulling this branch
+> takes your key out of the build and every upload fails with
+> "No API key in this build". Recreate `local.properties` as above. Gradle now
+> prints a loud warning at build time when the key is missing or still a
+> placeholder, rather than letting you find out on the watch.
 
 > **If you cloned this before the key was removed:** the repository's history
 > contains a real `pk_...` key. Rotate it in Pocket. Deleting the file from the

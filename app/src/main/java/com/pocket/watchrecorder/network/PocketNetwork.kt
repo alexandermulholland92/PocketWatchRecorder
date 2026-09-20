@@ -53,12 +53,12 @@ import kotlin.coroutines.resumeWithException
 private const val BASE_URL = "https://public.heypocketai.com/"
 
 /**
- * The Pocket key, supplied at build time from `local.properties`.
+ * The Pocket key, supplied at build time from `local.properties` or the
+ * POCKET_API_KEY environment variable.
  *
  * There is deliberately no in-source fallback constant: the one that used to
  * live here invited pasting a live key into a tracked file, which is exactly
- * how this repository leaked one. Put the key in `local.properties`
- * (see `local.properties.example`) and nowhere else.
+ * how this repository leaked one.
  *
  * Note this still ships in the APK as a plaintext constant — fine for a
  * personal sideload, not fine for a build you hand to someone else.
@@ -67,8 +67,27 @@ internal val API_KEY: String = BuildConfig.POCKET_API_KEY
     .removePrefix("Bearer ")
     .trim()
 
+/**
+ * Text that means "nobody filled this in".
+ *
+ * A blank key is not the only way to end up without one: copying
+ * local.properties.example without editing it, or a checkout whose key was
+ * replaced with a placeholder before being committed, both produce a non-blank
+ * string that sails through an isNotBlank() check and is then rejected by the
+ * server as an opaque 401.
+ */
+private val PLACEHOLDER_KEY_MARKERS = listOf(
+    "paste", "your_api_key", "your-api-key", "your key", "your_key", "yourkey", "xxx"
+)
+
+/** Whether [key] is something worth sending to Pocket at all. */
+internal fun isUsableApiKey(key: String): Boolean {
+    val normalized = key.trim().lowercase()
+    return normalized.isNotEmpty() && PLACEHOLDER_KEY_MARKERS.none { normalized.contains(it) }
+}
+
 internal val isApiKeyConfigured: Boolean
-    get() = API_KEY.isNotBlank()
+    get() = isUsableApiKey(API_KEY)
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -146,8 +165,15 @@ data class RecordingResponse(
 /** Thrown when the pipeline itself reports a failure (as opposed to transport). */
 class PocketPipelineException(message: String) : IOException(message)
 
-/** Thrown when no API key was baked into the build. */
-class MissingApiKeyException : IOException("No Pocket API key in this build")
+/**
+ * Thrown when no usable API key was baked into the build.
+ *
+ * Worth its own type because it is a build configuration mistake, not a
+ * transport failure: retrying cannot help, and the fix is in local.properties
+ * rather than anything the user can do on the watch.
+ */
+class MissingApiKeyException :
+    IOException("No Pocket API key in this build — set POCKET_API_KEY in local.properties")
 
 // ---------------------------------------------------------------------------
 // Retrofit API
