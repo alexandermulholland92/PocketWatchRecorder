@@ -2,7 +2,6 @@ package com.pocket.watchrecorder.upload
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -92,6 +91,11 @@ class NormalizeRecordedAtTest {
     }
 }
 
+/**
+ * The label the watch shows in its own library. Deliberately not sent to
+ * Pocket: a supplied title permanently suppresses its naming from the
+ * transcript, and there is no rename endpoint to undo that.
+ */
 class LocalTitleTest {
 
     @Test
@@ -132,50 +136,6 @@ class LocalTitleTest {
         assertNull(localTitleFor("2026-09-20T14:29:00"))
         assertNull(localTitleFor("not a date"))
         assertNull(localTitleFor(""))
-    }
-}
-
-class TitleToSendTest {
-
-    private val recordedAt = "2026-09-20T14:29:00-07:00"
-
-    @Test
-    fun `a short recording gets our local-time title`() {
-        // Pocket never names these itself, so supplying one costs nothing and
-        // fixes a default that would otherwise read in UTC.
-        assertEquals(
-            "Recording Sep 20, 2026 2:29 PM",
-            titleToSend(durationSeconds = 30, recordedAt = recordedAt)
-        )
-        assertEquals(
-            "Recording Sep 20, 2026 2:29 PM",
-            titleToSend(AI_TITLE_MIN_SECONDS - 1, recordedAt)
-        )
-    }
-
-    @Test
-    fun `a long recording is left for Pocket to name`() {
-        // Supplying a title suppresses summarization's own, and there is no
-        // rename endpoint to undo that later.
-        assertNull(titleToSend(AI_TITLE_MIN_SECONDS, recordedAt))
-        assertNull(titleToSend(durationSeconds = 1869, recordedAt = recordedAt))
-    }
-
-    @Test
-    fun `the split matches what this account actually does`() {
-        // Every recording under 70s kept a generic title; every one over 155s
-        // got a descriptive one. The threshold has to sit between them.
-        for (short in listOf(21L, 26L, 45L, 59L, 67L)) {
-            assertNotNull("$short s should carry our title", titleToSend(short, recordedAt))
-        }
-        for (long in listOf(155L, 1022L, 1869L, 2913L)) {
-            assertNull("$long s should be left to Pocket", titleToSend(long, recordedAt))
-        }
-    }
-
-    @Test
-    fun `an unusable timestamp sends no title rather than a wrong one`() {
-        assertNull(titleToSend(durationSeconds = 30, recordedAt = "not a date"))
     }
 }
 
