@@ -33,23 +33,23 @@ fun looksLikePlaceholder(value: String): Boolean =
 
 val pocketApiKey: String = localProperty("POCKET_API_KEY").orEmpty()
 
-// Say so at build time. Baking in an empty key and letting it surface as a
-// failed upload on the watch is a miserable way to find out, and it is exactly
-// what happened when local.properties stopped being a tracked file.
+// A build-time key is optional now that one can be entered on the watch, but
+// silence either way is how a key going missing went unnoticed before.
 if (pocketApiKey.isBlank()) {
-    logger.warn(
-        "\n**********************************************************************\n" +
-        "POCKET_API_KEY is not set. The app will build, but every upload will\n" +
-        "fail with \"No API key in this build\".\n" +
-        "Set it in local.properties (see local.properties.example) or export\n" +
-        "POCKET_API_KEY in your environment.\n" +
-        "**********************************************************************"
+    logger.lifecycle(
+        "\n----------------------------------------------------------------------\n" +
+        "No POCKET_API_KEY baked in. This is fine, and is the right default for\n" +
+        "anything you publish: set the key on the watch under Settings.\n" +
+        "To bake one in instead, put POCKET_API_KEY in local.properties or\n" +
+        "export it in your environment.\n" +
+        "----------------------------------------------------------------------"
     )
 } else if (looksLikePlaceholder(pocketApiKey)) {
     logger.warn(
         "\n**********************************************************************\n" +
         "POCKET_API_KEY still looks like a placeholder (\"" + pocketApiKey.take(12) + "...\").\n" +
-        "Uploads will be rejected. Put your real Pocket key in local.properties.\n" +
+        "It will be ignored. Put a real key in local.properties, or set one on\n" +
+        "the watch under Settings.\n" +
         "**********************************************************************"
     )
 }
