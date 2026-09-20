@@ -12,6 +12,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.serializer
 import okhttp3.Call
 import okhttp3.Callback
@@ -210,6 +213,37 @@ data class RecordingResponse(
 
 /** Thrown when the pipeline itself reports a failure (as opposed to transport). */
 class PocketPipelineException(message: String) : IOException(message)
+
+/**
+ * Pocket's own explanation for a failed call, if it gave one.
+ *
+ * Worth surfacing: "HTTP 403" on its own sent someone round a long diagnostic
+ * loop that the server had already answered with "insufficient scope for this
+ * operation". Errors arrive as `{"success":false,"error":"..."}`; anything else
+ * falls back to the raw body.
+ *
+ * This is the server's message and nothing else. An earlier version of this
+ * code appended the API key's first and last characters, which is why the
+ * detail was removed wholesale rather than trimmed — that part is not coming
+ * back.
+ */
+internal fun HttpException.pocketErrorMessage(): String? {
+    // Retrofit buffers the error body for a failed call, so reading it here is
+    // safe and does not consume a live stream.
+    val body = runCatching { response()?.errorBody()?.string() }.getOrNull()
+        ?.takeIf { it.isNotBlank() }
+        ?: return null
+
+    val explanation = runCatching {
+        Json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.contentOrNull
+    }.getOrNull() ?: body
+
+    return explanation
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .takeIf { it.isNotBlank() }
+        ?.take(70)
+}
 
 /**
  * Thrown when no usable API key was baked into the build.

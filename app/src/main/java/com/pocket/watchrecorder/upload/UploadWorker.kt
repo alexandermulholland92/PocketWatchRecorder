@@ -23,6 +23,7 @@ import com.pocket.watchrecorder.R
 import com.pocket.watchrecorder.audio.AudioRecorderManager
 import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
+import com.pocket.watchrecorder.network.pocketErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -260,9 +261,12 @@ class UploadWorker(
     }
 
     private fun Throwable.shortMessage(): String = when (this) {
-        // Persisted, so this is what the failure screen shows.
+        // Persisted, so this is what the failure screen shows. Carry Pocket's
+        // own words: the status code alone is rarely the whole story.
         is MissingApiKeyException -> "No API key — see Settings"
-        is HttpException -> "HTTP ${code()}"
+        is HttpException -> pocketErrorMessage()
+            ?.let { "HTTP ${code()}: $it" }
+            ?: "HTTP ${code()}"
         else -> this::class.java.simpleName + (message?.let { ": ${it.take(50)}" } ?: "")
     }
 

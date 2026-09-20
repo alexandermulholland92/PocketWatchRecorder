@@ -16,6 +16,7 @@ import com.pocket.watchrecorder.network.MissingApiKeyException
 import com.pocket.watchrecorder.network.PocketClient
 import com.pocket.watchrecorder.network.PocketCredentials
 import com.pocket.watchrecorder.network.PocketPipelineException
+import com.pocket.watchrecorder.network.pocketErrorMessage
 import com.pocket.watchrecorder.upload.QueuedUpload
 import com.pocket.watchrecorder.upload.UploadProgress
 import com.pocket.watchrecorder.upload.UploadQueue
@@ -607,12 +608,19 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         is UnknownHostException -> "No connection"
         is SocketTimeoutException -> "Network timed out"
         is PocketPipelineException -> message ?: "Processing failed"
-        is HttpException -> when (code()) {
-            401, 403 -> "Key rejected — check your API key"
-            413 -> "Recording too large"
-            429 -> "Rate limited — retry soon"
-            in 500..599 -> "Pocket is unavailable"
-            else -> "Pocket error ${code()}"
+        is HttpException -> {
+            // Pocket's explanation beats anything invented here: a 403 can mean
+            // a bad key or a key without the scope for this call, and only the
+            // server knows which.
+            val explanation = pocketErrorMessage()
+            when {
+                explanation != null -> explanation
+                code() == 401 || code() == 403 -> "Key rejected — check your API key"
+                code() == 413 -> "Recording too large"
+                code() == 429 -> "Rate limited — retry soon"
+                code() in 500..599 -> "Pocket is unavailable"
+                else -> "Pocket error ${code()}"
+            }
         }
 
         is IOException -> "Upload failed"
