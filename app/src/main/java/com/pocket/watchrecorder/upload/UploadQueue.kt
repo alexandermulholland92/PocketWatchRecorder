@@ -291,14 +291,15 @@ internal fun recordedAtStamp(
     .format(UploadQueue.OFFSET_FORMAT)
 
 /**
- * The recording's title, in its own local time.
+ * A label reading in the recording's own local time, for the watch's library.
  *
- * Sent at provisioning and used for the watch's library list. Pocket's own
- * default renders the timestamp in UTC, and it will not rename a recording
+ * Not sent to Pocket. Supplying a title at provisioning suppresses Pocket's
+ * own naming from the transcript, and it will not rename a recording
  * afterwards — PATCH on the recording endpoint answers 405 with "allow: GET"
- * — so supplying it up front is the only way the title can show the right
- * time. The cost is Pocket's naming from the transcript, which a supplied
- * title suppresses; a title that reads correctly is worth more.
+ * — so a title sent up front is permanent. Leaving the field empty is the
+ * deliberate choice: the generated title is worth more than a correct
+ * timestamp in the title, and the recording's real time is shown correctly
+ * elsewhere because recording_at carries a proper offset.
  *
  * Derived from [recordedAt] rather than the clock, so it stays right for an
  * entry that sat in the queue overnight. The offset carried in the timestamp
