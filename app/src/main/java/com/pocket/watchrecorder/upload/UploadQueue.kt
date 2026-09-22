@@ -12,7 +12,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
-import java.time.Duration
+import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -279,15 +279,30 @@ class UploadQueue(private val context: Context) {
  *
  * An explicit formatter rather than toString(): the latter drops ":00" seconds,
  * and a strict parser is exactly what we are dealing with.
+ *
+ * The duration is subtracted from the *instant*, not from the wall clock. A
+ * LocalDateTime has no notion of a zone, so subtracting from one walks the
+ * clock face backwards by the stated amount whether or not that many minutes
+ * actually passed. Across a DST transition they disagree, and the result was
+ * wrong in both directions: a ten-minute recording starting at 01:57 on the
+ * spring-forward day was stamped 03:57-07:00 instead of 01:57-08:00, because
+ * the subtraction landed on 02:57, an hour that does not exist, and resolving
+ * it pushed forward again on top of the hour already lost. The same recording
+ * on the fall-back day was stamped an hour early. Instant arithmetic runs on
+ * the real timeline, and atZone then picks the offset in force at that
+ * instant, so both come out exact.
+ *
+ * This also covers the watch changing zone mid-recording, which fails the same
+ * way for the same reason.
  */
 internal fun recordedAtStamp(
     durationMs: Long,
     zone: ZoneId = ZoneId.systemDefault(),
-    now: LocalDateTime = LocalDateTime.now(zone)
+    now: Instant = Instant.now()
 ): String = now
-    .minus(Duration.ofMillis(durationMs))
-    .truncatedTo(ChronoUnit.SECONDS)
+    .minusMillis(durationMs)
     .atZone(zone)
+    .truncatedTo(ChronoUnit.SECONDS)
     .format(UploadQueue.OFFSET_FORMAT)
 
 /**

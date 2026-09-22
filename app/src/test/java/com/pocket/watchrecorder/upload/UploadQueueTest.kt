@@ -5,15 +5,23 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
 
 class RecordedAtStampTest {
 
     private val zone: ZoneId = ZoneId.of("America/Los_Angeles")
 
-    /** 2026-09-11 15:30:00 local, i.e. during PDT (UTC-07:00). */
-    private val now: LocalDateTime = LocalDateTime.of(2026, 9, 11, 15, 30, 0)
+    /**
+     * The instant of 2026-09-11 15:30:00 in Los Angeles, i.e. during PDT
+     * (UTC-07:00). An instant rather than a wall clock, because that is what
+     * the recorder actually has and what survives a zone change.
+     */
+    private val now: Instant =
+        ZonedDateTime.of(2026, 9, 11, 15, 30, 0, 0, zone).toInstant()
 
     /** What the API demands, and rejected us for not sending. */
     private val rfc3339 = Regex("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(Z|[+-]\\d{2}:\\d{2})$")
@@ -29,8 +37,10 @@ class RecordedAtStampTest {
 
     @Test
     fun `a UTC device still produces a valid zone marker`() {
+        // The same instant as above, read on a watch set to UTC: seven hours
+        // later on the clock face, and marked "Z" rather than an offset.
         val stamp = recordedAtStamp(0, ZoneId.of("UTC"), now)
-        assertEquals("2026-09-11T15:30:00Z", stamp)
+        assertEquals("2026-09-11T22:30:00Z", stamp)
         assertTrue("not RFC3339: $stamp", rfc3339.matches(stamp))
     }
 
@@ -46,6 +56,43 @@ class RecordedAtStampTest {
     fun `seconds are always written, even when they are zero`() {
         // LocalDateTime.toString() would drop them, and this parser is strict.
         assertTrue(recordedAtStamp(0, zone, now).contains(":30:00"))
+    }
+
+    @Test
+    fun `a recording across spring forward is stamped at its real start`() {
+        // Starts 01:57 PST, runs ten real minutes, ends 03:07 PDT: the clock
+        // face skipped an hour mid-recording. Subtracting ten minutes from the
+        // face lands on 02:57, an hour that does not exist that day, and
+        // resolving the gap pushes forward again — which is how the wall-clock
+        // version stamped this 03:57-07:00, two hours late.
+        val start = ZonedDateTime.of(2026, 3, 8, 1, 57, 0, 0, zone)
+        assertEquals("2026-03-08T01:57:00-08:00", start.format(UploadQueue.OFFSET_FORMAT))
+        assertEquals(
+            "2026-03-08T01:57:00-08:00",
+            recordedAtStamp(600_000, zone, start.toInstant().plusMillis(600_000))
+        )
+    }
+
+    @Test
+    fun `a recording across fall back is stamped at its real start`() {
+        // 01:57 happens twice that day. This one starts on the first pass,
+        // still PDT, and ends at 01:07 PST — the clock face ran backwards, so
+        // the wall-clock version stamped it 00:57-07:00, an hour early.
+        val start = ZonedDateTime.ofLocal(
+            LocalDateTime.of(2026, 11, 1, 1, 57, 0), zone, ZoneOffset.ofHours(-7)
+        )
+        assertEquals(
+            "2026-11-01T01:57:00-07:00",
+            recordedAtStamp(600_000, zone, start.toInstant().plusMillis(600_000))
+        )
+    }
+
+    @Test
+    fun `the offset follows the season, not a value fixed at install`() {
+        val winter = ZonedDateTime.of(2026, 1, 15, 12, 0, 0, 0, zone).toInstant()
+        val summer = ZonedDateTime.of(2026, 7, 15, 12, 0, 0, 0, zone).toInstant()
+        assertEquals("2026-01-15T12:00:00-08:00", recordedAtStamp(0, zone, winter))
+        assertEquals("2026-07-15T12:00:00-07:00", recordedAtStamp(0, zone, summer))
     }
 
     @Test
@@ -80,6 +127,21 @@ class NormalizeRecordedAtTest {
         assertEquals(
             "2026-09-11T22:28:00Z",
             normalizeRecordedAt("2026-09-11T22:28:00Z", zone)
+        )
+    }
+
+    @Test
+    fun `the offset comes from the stored date, not from today`() {
+        // A recording queued in January and drained in July must keep PST.
+        // atZone reads the rule table for that date, so this holds whenever
+        // the upload happens to run.
+        assertEquals(
+            "2026-01-15T12:00:00-08:00",
+            normalizeRecordedAt("2026-01-15T12:00:00", zone)
+        )
+        assertEquals(
+            "2026-07-15T12:00:00-07:00",
+            normalizeRecordedAt("2026-07-15T12:00:00", zone)
         )
     }
 
